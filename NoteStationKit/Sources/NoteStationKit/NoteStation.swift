@@ -48,6 +48,24 @@ public actor NoteStation {
         }
     }
 
+    /// Добавить в «Избранное». category: notebook, note, stack, tag; id — как в Shortcut.list
+    /// (у стопки «Название#uid», у тега «Название@uid»).
+    public func addShortcut(category: String, id: String) async throws {
+        _ = try await dsm.call("SYNO.NoteStation.Shortcut", "set", version: 1, [Self.shortcutKey(category): .string(id)])
+    }
+
+    public func removeShortcut(category: String, id: String) async throws {
+        _ = try await dsm.call("SYNO.NoteStation.Shortcut", "delete", version: 1, [Self.shortcutKey(category): .string(id)])
+    }
+
+    private static func shortcutKey(_ category: String) -> String {
+        switch category {
+        case "stack": "stack_id"
+        case "tag": "tag_id"
+        default: "object_id"
+        }
+    }
+
     // MARK: Теги
 
     public func tags() async throws -> [NSTag] {
@@ -167,6 +185,14 @@ public actor NoteStation {
     public func attachmentURL(noteID: String, fileID: String) async throws -> URL {
         try await dsm.url("SYNO.NoteStation.Note", "download", version: 3, [
             "object_id": .string(noteID), "file_id": .string(fileID), "format": "raw",
+        ])
+    }
+
+    /// Превью заметки (как карточки в Note Station).
+    public func thumbnailData(noteID: String, md5: String) async throws -> Data {
+        try await dsm.download("SYNO.NoteStation.Note", "download", version: 3, [
+            "object_id": .string(noteID), "file_id": "thumb", "format": "raw",
+            "md5": .string(md5), "filename": "thumb.png",
         ])
     }
 

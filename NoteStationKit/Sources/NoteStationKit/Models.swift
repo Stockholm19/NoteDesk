@@ -76,6 +76,8 @@ public struct NSNote: Sendable, Hashable, Identifiable {
     public var recycle: Bool
     public var encrypt: Bool
     public var archive: Bool
+    /// md5 превью-картинки (Note Station сам делает thumb из первой картинки); nil — превью нет.
+    public var thumbMD5: String?
     /// HTML-тело. nil — не загружено.
     public var content: String?
     public var attachments: [NSAttachment]
@@ -94,6 +96,7 @@ public struct NSNote: Sendable, Hashable, Identifiable {
         recycle = v["recycle"]?.bool ?? false
         encrypt = v["encrypt"]?.bool ?? false
         archive = v["archive"]?.bool ?? false
+        thumbMD5 = v["thumb"]?["md5"]?.string
         content = v["content"]?.string
         if let dict = v["attachment"]?.object {
             attachments = dict.map { NSAttachment(id: $0.key, $0.value) }.sorted { $0.id < $1.id }

@@ -176,6 +176,13 @@ struct NoteListView: View {
                     .disabled(nb.remoteID == note.notebookID)
             }
         }
+        if let rid = note.remoteID {
+            let fav = engine.isFavorite(category: "note", key: rid)
+            Button(fav ? "Убрать из избранного" : "Добавить в избранное", systemImage: fav ? "star.slash" : "star") {
+                Task { await engine.setFavorite(!fav, category: "note", key: rid) }
+            }
+        }
+        Divider()
         Button("Удалить", systemImage: "trash", role: .destructive) { delete(note) }
     }
 
@@ -197,35 +204,85 @@ struct NoteRow: View {
     let notebook: String?
     var showCreated = false
 
+    /// Дата, по которой отсортирован список
+    private var date: Date { showCreated ? note.ctime : note.mtime }
+    private var hasThumb: Bool { note.thumbMD5 != nil && note.remoteID != nil }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 3) {
-            HStack(spacing: 4) {
-                if note.isEncrypted { Image(systemName: "lock.fill").font(.caption) }
-                Text(note.displayTitle).font(.headline).lineLimit(1)
-                Spacer(minLength: 4)
-                if note.isDirty {
-                    Image(systemName: "arrow.up.circle")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .help("Ещё не отправлено на сервер")
+        HStack(alignment: .top, spacing: 10) {
+            // Как в Note Station: превью картинки или крупная дата
+            if hasThumb, let md5 = note.thumbMD5, let rid = note.remoteID {
+                NoteThumb(noteID: rid, md5: md5)
+            } else {
+                DateBadge(date: date)
+            }
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 4) {
+                    if note.isEncrypted { Image(systemName: "lock.fill").font(.caption) }
+                    Text(note.displayTitle).font(.headline).lineLimit(1)
+                    Spacer(minLength: 4)
+                    if note.isDirty {
+                        Image(systemName: "arrow.up.circle")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .help("Ещё не отправлено на сервер")
+                    }
                 }
-            }
-            if !note.brief.isEmpty {
-                Text(note.brief).font(.subheadline).foregroundStyle(.secondary).lineLimit(2)
-            }
-            HStack(spacing: 4) {
-                if showCreated {
-                    Text("создана \(note.ctime.formatted(date: .abbreviated, time: .omitted))")
-                } else {
-                    Text(note.mtime, format: .relative(presentation: .named))
+                if !note.brief.isEmpty {
+                    Text(note.brief).font(.subheadline).foregroundStyle(.secondary).lineLimit(2)
                 }
-                if let notebook { Text("· \(notebook)") }
+                HStack(spacing: 4) {
+                    // Дата уже видна в бейдже — повторяем её только рядом с превью
+                    if hasThumb {
+                        Text(date.formatted(.dateTime.day().month().hour().minute()))
+                    }
+                    if let notebook { Text(hasThumb ? "· \(notebook)" : notebook) }
+                }
+                .lineLimit(1)
+                .font(.caption)
+                .foregroundStyle(.tertiary)
             }
-            .lineLimit(1)
-            .font(.caption)
-            .foregroundStyle(.tertiary)
         }
-        .padding(.vertical, 2)
+        .padding(.vertical, 3)
+    }
+}
+
+/// Число и время вместо превью — для заметок без картинок.
+struct DateBadge: View {
+    let date: Date
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Text(date.formatted(.dateTime.day(.twoDigits)))
+                .font(.system(size: 26, weight: .light, design: .rounded))
+            Text(date.formatted(.dateTime.hour(.twoDigits(amPM: .omitted)).minute(.twoDigits)))
+                .font(.caption2.monospacedDigit())
+        }
+        .foregroundStyle(.tint)
+        .frame(width: 56, height: 56)
+    }
+}
+
+/// Превью первой картинки заметки (Note Station делает его сам).
+struct NoteThumb: View {
+    @Environment(SyncEngine.self) private var engine
+    let noteID: String
+    let md5: String
+    @State private var image: CGImage?
+
+    var body: some View {
+        ZStack {
+            Rectangle().fill(.quaternary)
+            if let image {
+                Image(decorative: image, scale: 1)
+                    .resizable()
+                    .scaledToFill()
+            }
+        }
+        .frame(width: 56, height: 56)
+        .clipShape(RoundedRectangle(cornerRadius: 6))
+        .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(.separator, lineWidth: 0.5))
+        .task(id: md5) { image = await engine.thumbnail(noteID: noteID, md5: md5) }
     }
 }
 

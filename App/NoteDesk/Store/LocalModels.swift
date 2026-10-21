@@ -45,6 +45,8 @@ final class LocalNote {
     var needsContent: Bool
     /// ref → file_id для картинок внутри HTML.
     var imageRefs: [String: String]
+    /// md5 превью-картинки от Note Station; nil — превью нет.
+    var thumbMD5: String?
 
     init(remoteID: String? = nil, notebookID: String?, title: String, html: String?, brief: String = "",
          tags: [String] = [], remoteVer: String? = nil, ctime: Date = .now, mtime: Date = .now,

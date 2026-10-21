@@ -2,6 +2,7 @@ import Foundation
 import Observation
 import SwiftData
 import NoteStationKit
+import CoreGraphics
 import os
 
 let syncLog = Logger(subsystem: "ru.klotze.NoteDesk", category: "sync")
@@ -370,8 +371,9 @@ final class SyncEngine {
         for r in remoteNotes {
             if let local = localByID[r.id] {
                 guard !local.isDirty else { continue }   // наши правки уйдут при следующем push
+                // Метаданные из списка (заголовок, превью, даты) — всегда; apply пишет только изменения
+                apply(r, to: local, includeContent: false)
                 if Self.version(r) != local.remoteVer || local.body == nil {
-                    apply(r, to: local, includeContent: false)
                     local.needsContent = !r.encrypt
                 }
             } else {
@@ -457,6 +459,7 @@ final class SyncEngine {
         set(\.brief, r.brief)
         if let tags = r.tags { set(\.tags, tags) }
         set(\.isEncrypted, r.encrypt)
+        set(\.thumbMD5, r.thumbMD5)
         if let c = r.ctime { set(\.ctime, c) }
         if let m = r.mtime { set(\.mtime, m) }
         if includeContent {
@@ -504,6 +507,56 @@ final class SyncEngine {
         var d = FetchDescriptor<LocalNote>(predicate: #Predicate { $0.remoteID == remoteID })
         d.fetchLimit = 1
         return try? context.fetch(d).first
+    }
+
+    // MARK: Превью
+
+    private let thumbnails = ThumbnailStore()
+
+    func thumbnail(noteID: String, md5: String) async -> CGImage? {
+        await thumbnails.image(md5: md5) { [weak self] in
+            guard let self else { throw DSMError.notLoggedIn }
+            return try await self.authed { try await $0.thumbnailData(noteID: noteID, md5: md5) }
+        }
+    }
+
+    // MARK: Избранное
+
+    /// uid владельца — префикс id объектов («1026_…»); нужен для id стопок и тегов в ярлыках.
+    private var ownerUID: String? {
+        var d = FetchDescriptor<LocalNotebook>()
+        d.fetchLimit = 1
+        return (try? context.fetch(d))?.first?.remoteID.split(separator: "_").first.map(String.init)
+    }
+
+    /// id ярлыка в формате Note Station: стопка «Название#uid», тег «Название@uid».
+    func shortcutID(category: String, key: String) -> String {
+        guard let uid = ownerUID else { return key }
+        switch category {
+        case "stack": return "\(key)#\(uid)"
+        case "tag": return "\(key)@\(uid)"
+        default: return key
+        }
+    }
+
+    func isFavorite(category: String, key: String) -> Bool {
+        let id = shortcutID(category: category, key: key)
+        return shortcuts.contains { $0.category == category && $0.id == id }
+    }
+
+    func setFavorite(_ on: Bool, category: String, key: String) async {
+        let id = shortcutID(category: category, key: key)
+        do {
+            try await authed { api in
+                if on { try await api.addShortcut(category: category, id: id) }
+                else { try await api.removeShortcut(category: category, id: id) }
+            }
+            let list = try await authed { try await $0.shortcuts() }.map { Shortcut(category: $0.category, id: $0.id) }
+            shortcuts = list
+            try? UserDefaults.standard.set(JSONEncoder().encode(list), forKey: "shortcuts")
+        } catch {
+            phase = .error(Self.describe(error))
+        }
     }
 
     /// Вставленная в редактор картинка: хранится локально до загрузки на сервер.

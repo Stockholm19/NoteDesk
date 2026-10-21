@@ -130,6 +130,16 @@ do {
         try data.write(to: URL(fileURLWithPath: args[2]))
         print("\(data.count) байт → \(args[2])")
 
+    case "thumb":
+        // nsctl thumb <note_id> <out.png> — превью заметки
+        guard args.count >= 2 else { fail("nsctl thumb <note_id> <out>") }
+        let (_, ns) = client()
+        let n = try await ns.note(id: args[0])
+        guard let md5 = n.thumbMD5 else { fail("У заметки нет превью") }
+        let data = try await ns.thumbnailData(noteID: n.id, md5: md5)
+        try data.write(to: URL(fileURLWithPath: args[1]))
+        print("\(data.count) байт → \(args[1])")
+
     case "imgtest":
         // nsctl imgtest <note_id> <file.png> — добавить картинку в конец заметки
         guard args.count >= 2 else { fail("nsctl imgtest <note_id> <file.png>") }

@@ -16,7 +16,13 @@ struct SidebarView: View {
             if !favorites.isEmpty {
                 Section("Избранное", isExpanded: sectionBinding("fav")) {
                     ForEach(favorites, id: \.item) { f in
-                        Label(f.title, systemImage: f.icon).tag(f.item)
+                        Label(f.title, systemImage: f.icon)
+                            .tag(f.item)
+                            .contextMenu {
+                                Button("Убрать из избранного", systemImage: "star.slash") {
+                                    Task { await engine.setFavorite(false, category: f.category, key: f.key) }
+                                }
+                            }
                     }
                 }
             }
@@ -37,6 +43,7 @@ struct SidebarView: View {
                             Label(name, systemImage: "books.vertical")
                                 .badge(books.count)
                                 .tag(SidebarItem.stack(name))
+                                .contextMenu { favoriteButton(category: "stack", key: name) }
                         }
                     case .notebook(let nb):
                         notebookRow(nb)
@@ -47,7 +54,9 @@ struct SidebarView: View {
             if !engine.stats.tags.isEmpty {
                 Section("Теги", isExpanded: sectionBinding("tags")) {
                     ForEach(engine.stats.tags, id: \.self) { t in
-                        Label(t, systemImage: "tag").tag(SidebarItem.tag(t))
+                        Label(t, systemImage: "tag")
+                            .tag(SidebarItem.tag(t))
+                            .contextMenu { favoriteButton(category: "tag", key: t) }
                     }
                 }
             }
@@ -96,6 +105,15 @@ struct SidebarView: View {
         Label(nb.title, systemImage: "book.closed")
             .badge(engine.stats.counts[nb.remoteID] ?? 0)
             .tag(SidebarItem.notebook(nb.remoteID))
+            .contextMenu { favoriteButton(category: "notebook", key: nb.remoteID) }
+    }
+
+    /// «В избранное» / «Убрать из избранного» — как звёздочка в Note Station.
+    private func favoriteButton(category: String, key: String) -> some View {
+        let fav = engine.isFavorite(category: category, key: key)
+        return Button(fav ? "Убрать из избранного" : "Добавить в избранное", systemImage: fav ? "star.slash" : "star") {
+            Task { await engine.setFavorite(!fav, category: category, key: key) }
+        }
     }
 
     // MARK: Стопки — как «Записные книги» в Note Station
@@ -153,24 +171,25 @@ struct SidebarView: View {
 
     // MARK: Избранное — ярлыки из Note Station
 
-    private struct Favorite { var item: SidebarItem; var title: String; var icon: String }
+    /// key — то, что передаётся в setFavorite: id блокнота/заметки или название стопки/тега.
+    private struct Favorite { var item: SidebarItem; var title: String; var icon: String; var category: String; var key: String }
 
     private var favorites: [Favorite] {
         engine.shortcuts.compactMap { s in
             switch s.category {
             case "notebook":
                 guard let nb = notebooks.first(where: { $0.remoteID == s.id }) else { return nil }
-                return Favorite(item: .notebook(s.id), title: nb.title, icon: "book.closed")
+                return Favorite(item: .notebook(s.id), title: nb.title, icon: "book.closed", category: "notebook", key: s.id)
             case "stack":
                 // id стопки — «Название#uid владельца»
                 let name = s.id.range(of: "#", options: .backwards).map { String(s.id[..<$0.lowerBound]) } ?? s.id
-                return Favorite(item: .stack(name), title: name, icon: "books.vertical")
+                return Favorite(item: .stack(name), title: name, icon: "books.vertical", category: "stack", key: name)
             case "tag":
                 let title = s.id.split(separator: "@").first.map(String.init) ?? s.id
-                return Favorite(item: .tag(title), title: title, icon: "tag")
+                return Favorite(item: .tag(title), title: title, icon: "tag", category: "tag", key: title)
             case "note":
                 guard let t = engine.noteTitle(remoteID: s.id) else { return nil }
-                return Favorite(item: .note(s.id), title: t, icon: "doc.text")
+                return Favorite(item: .note(s.id), title: t, icon: "doc.text", category: "note", key: s.id)
             default:
                 return nil
             }
