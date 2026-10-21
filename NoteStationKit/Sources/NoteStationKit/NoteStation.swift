@@ -37,6 +37,44 @@ public actor NoteStation {
         ])
     }
 
+    /// Переложить блокнот в стопку; пустая строка — «Удалить с полки».
+    /// Переименование и разбор стопки тоже делаются этим вызовом для каждого блокнота:
+    /// SYNO.NoteStation.Stack.set/delete на 2.6.10 отвечает ошибкой 114.
+    public func setNotebookStack(id: String, stack: String) async throws {
+        _ = try await dsm.call("SYNO.NoteStation.Notebook", "set", version: 2, [
+            "object_id": .string(id), "stack": .string(stack), "commit_msg": commitMsg,
+        ])
+    }
+
+    /// «Установить как записную книжку по умолчанию»
+    public func setPresetNotebook(id: String) async throws {
+        _ = try await dsm.call("SYNO.NoteStation.Notebook.Preset", "set", version: 1, [
+            "object_id": .string(id), "commit_msg": commitMsg,
+        ])
+    }
+
+    /// Архивировать / вернуть из архива. Операция фоновая: запускаем и ждём завершения.
+    public func archiveNotebook(id: String, enable: Bool) async throws {
+        let start = try await dsm.call("SYNO.NoteStation.Notebook.Polling", "archive", version: 1, [
+            "object_id": .string(id), "enable": .bool(enable),
+        ])
+        guard let task = start["task_id"]?.stringish else { throw DSMError.malformedResponse }
+        defer { Task { [dsm] in _ = try? await dsm.call("SYNO.NoteStation.Notebook.Polling", "archive_stop", version: 1, ["task_id": .string(task)]) } }
+        for _ in 0..<60 {
+            let st = try await dsm.call("SYNO.NoteStation.Notebook.Polling", "archive_status", version: 1, ["task_id": .string(task)])
+            if st["finish"]?.bool == true { return }
+            try await Task.sleep(for: .milliseconds(800))
+        }
+    }
+
+    /// Удалить блокнот. recursive=false — заметки уходят в корзину Note Station
+    /// (проверено: с recursive=true они удаляются безвозвратно).
+    public func deleteNotebook(id: String) async throws {
+        _ = try await dsm.call("SYNO.NoteStation.Notebook", "delete", version: 2, [
+            "object_id": .string(id), "recursive": false,
+        ])
+    }
+
     // MARK: Избранное
 
     /// Ярлыки «Избранного»: категория (notebook, note, tag, stack) и id.

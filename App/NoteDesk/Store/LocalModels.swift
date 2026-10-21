@@ -9,6 +9,10 @@ final class LocalNotebook {
     var ver: String?
     /// Стопка (группа блокнотов) в Note Station; nil — блокнот без стопки.
     var stack: String?
+    /// Записная книжка по умолчанию.
+    var isPreset: Bool = false
+    /// В архиве Note Station.
+    var isArchived: Bool = false
 
     init(remoteID: String, title: String, ver: String?, stack: String? = nil) {
         self.remoteID = remoteID

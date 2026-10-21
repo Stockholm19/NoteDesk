@@ -10,6 +10,32 @@ struct SidebarView: View {
     @State private var newNotebook = false
     @State private var newNotebookTitle = ""
     @State private var confirmLogout = false
+    // Диалоги контекстного меню
+    @State private var prompt: Prompt?
+    @State private var promptText = ""
+    @State private var deleting: LocalNotebook?
+
+    /// Диалог с полем ввода: переименование блокнота/стопки или новая стопка.
+    private enum Prompt: Identifiable {
+        case renameNotebook(id: String)
+        case renameStack(String)
+        case newStack(notebookID: String)
+
+        var id: String {
+            switch self {
+            case .renameNotebook(let id): "rn:" + id
+            case .renameStack(let n): "rs:" + n
+            case .newStack(let id): "ns:" + id
+            }
+        }
+        var title: String {
+            switch self {
+            case .renameNotebook: "Переименовать записную книгу"
+            case .renameStack: "Переименовать стопку"
+            case .newStack: "Новая стопка"
+            }
+        }
+    }
 
     var body: some View {
         List(selection: $selection) {
@@ -18,10 +44,10 @@ struct SidebarView: View {
                     ForEach(favorites, id: \.item) { f in
                         Label(f.title, systemImage: f.icon)
                             .tag(f.item)
-                            .contextMenu {
-                                Button("Убрать из избранного", systemImage: "star.slash") {
+                            .entryContextMenu {
+                                [.action("Убрать из Избранного", "star.slash") {
                                     Task { await engine.setFavorite(false, category: f.category, key: f.key) }
-                                }
+                                }]
                             }
                     }
                 }
@@ -43,10 +69,24 @@ struct SidebarView: View {
                             Label(name, systemImage: "books.vertical")
                                 .badge(books.count)
                                 .tag(SidebarItem.stack(name))
-                                .contextMenu { favoriteButton(category: "stack", key: name) }
+                                .entryContextMenu { stackMenu(name) }
                         }
                     case .notebook(let nb):
                         notebookRow(nb)
+                    }
+                }
+            }
+
+            if !archived.isEmpty {
+                Section("Архив", isExpanded: sectionBinding("archive")) {
+                    ForEach(archived) { nb in
+                        Label(nb.title, systemImage: "archivebox")
+                            .foregroundStyle(.secondary)
+                            .entryContextMenu {
+                                [.action("Вернуть из архива", "tray.and.arrow.up") {
+                                    Task { await engine.archiveNotebook(id: nb.remoteID, false) }
+                                }]
+                            }
                     }
                 }
             }
@@ -56,7 +96,7 @@ struct SidebarView: View {
                     ForEach(engine.stats.tags, id: \.self) { t in
                         Label(t, systemImage: "tag")
                             .tag(SidebarItem.tag(t))
-                            .contextMenu { favoriteButton(category: "tag", key: t) }
+                            .entryContextMenu { [favoriteEntry(category: "tag", key: t)] }
                     }
                 }
             }
@@ -95,6 +135,19 @@ struct SidebarView: View {
             }
             Button("Отмена", role: .cancel) { newNotebookTitle = "" }
         }
+        .alert(prompt?.title ?? "", isPresented: Binding(get: { prompt != nil }, set: { if !$0 { prompt = nil } })) {
+            TextField("Название", text: $promptText)
+            Button("Готово") { submitPrompt() }
+            Button("Отмена", role: .cancel) { prompt = nil }
+        }
+        .confirmationDialog(deleting.map { "Удалить «\($0.title)»? Заметки из неё попадут в корзину Note Station." } ?? "",
+                            isPresented: Binding(get: { deleting != nil }, set: { if !$0 { deleting = nil } }),
+                            titleVisibility: .visible) {
+            Button("Удалить", role: .destructive) {
+                if let nb = deleting { Task { await engine.deleteNotebook(id: nb.remoteID) } }
+                deleting = nil
+            }
+        }
         .confirmationDialog("Выйти из аккаунта? Локальная копия заметок будет удалена, неотправленные правки пропадут.",
                             isPresented: $confirmLogout, titleVisibility: .visible) {
             Button("Выйти", role: .destructive) { Task { await engine.logout() } }
@@ -102,19 +155,82 @@ struct SidebarView: View {
     }
 
     private func notebookRow(_ nb: LocalNotebook) -> some View {
-        Label(nb.title, systemImage: "book.closed")
+        // Звезда — записная книжка по умолчанию, как в Note Station
+        Label(nb.title, systemImage: nb.isPreset ? "star.square" : "book.closed")
             .badge(engine.stats.counts[nb.remoteID] ?? 0)
             .tag(SidebarItem.notebook(nb.remoteID))
-            .contextMenu { favoriteButton(category: "notebook", key: nb.remoteID) }
+            .entryContextMenu { notebookMenu(nb) }
     }
 
-    /// «В избранное» / «Убрать из избранного» — как звёздочка в Note Station.
-    private func favoriteButton(category: String, key: String) -> some View {
+    // MARK: Контекстные меню — как в Note Station
+
+    private func notebookMenu(_ nb: LocalNotebook) -> [MenuEntry] {
+        let id = nb.remoteID
+        var move: [MenuEntry] = stackNames.filter { $0 != nb.stack }.map { name in
+            .action(name, "books.vertical") { Task { await engine.moveNotebook(id: id, toStack: name) } }
+        }
+        if !move.isEmpty { move.append(.divider) }
+        move.append(.action("Новая стопка…", "plus") { promptText = ""; prompt = .newStack(notebookID: id) })
+
+        var items: [MenuEntry] = [
+            .action("Переименовать…", "pencil") { promptText = nb.title; prompt = .renameNotebook(id: id) },
+            favoriteEntry(category: "notebook", key: id),
+            .submenu("Переместить в", "folder", move),
+        ]
+        if nb.stack != nil {
+            items.append(.action("Удалить с полки", "tray.and.arrow.up") {
+                Task { await engine.moveNotebook(id: id, toStack: nil) }
+            })
+        }
+        items += [
+            .action("Удалить…", "trash", disabled: nb.isPreset) { deleting = nb },
+            .divider,
+            .action("Установить как записную книжку по умолчанию", "star", disabled: nb.isPreset) {
+                Task { await engine.setPresetNotebook(id: id) }
+            },
+            .action("Архивировать", "archivebox", disabled: nb.isPreset) {
+                Task { await engine.archiveNotebook(id: id, true) }
+            },
+        ]
+        return items
+    }
+
+    private func stackMenu(_ name: String) -> [MenuEntry] {
+        [
+            .action("Переименовать…", "pencil") { promptText = name; prompt = .renameStack(name) },
+            favoriteEntry(category: "stack", key: name),
+            .action("Разобрать", "square.stack.3d.down.right") { Task { await engine.ungroupStack(name) } },
+        ]
+    }
+
+    /// «Добавить в Избранное» / «Убрать из Избранного» — как звёздочка в Note Station.
+    private func favoriteEntry(category: String, key: String) -> MenuEntry {
         let fav = engine.isFavorite(category: category, key: key)
-        return Button(fav ? "Убрать из избранного" : "Добавить в избранное", systemImage: fav ? "star.slash" : "star") {
+        return .action(fav ? "Убрать из Избранного" : "Добавить в Избранное", fav ? "star.slash" : "star") {
             Task { await engine.setFavorite(!fav, category: category, key: key) }
         }
     }
+
+    private func submitPrompt() {
+        let text = promptText.trimmingCharacters(in: .whitespaces)
+        defer { prompt = nil }
+        guard !text.isEmpty, let p = prompt else { return }
+        Task {
+            switch p {
+            case .renameNotebook(let id): await engine.renameNotebook(id: id, title: text)
+            case .renameStack(let old):
+                await engine.renameStack(old, to: text)
+                if selection == .stack(old) { selection = .stack(text) }
+            case .newStack(let id): await engine.moveNotebook(id: id, toStack: text)
+            }
+        }
+    }
+
+    private var stackNames: [String] {
+        Set(notebooks.compactMap(\.stack)).sorted { $0.localizedStandardCompare($1) == .orderedAscending }
+    }
+
+    private var archived: [LocalNotebook] { notebooks.filter(\.isArchived) }
 
     // MARK: Стопки — как «Записные книги» в Note Station
 
@@ -140,7 +256,7 @@ struct SidebarView: View {
     private var shelf: [ShelfEntry] {
         var stacks: [String: [LocalNotebook]] = [:]
         var loose: [ShelfEntry] = []
-        for nb in notebooks {
+        for nb in notebooks where !nb.isArchived {
             if let s = nb.stack { stacks[s, default: []].append(nb) } else { loose.append(.notebook(nb)) }
         }
         let all = stacks.map { ShelfEntry.stack($0.key, $0.value) } + loose

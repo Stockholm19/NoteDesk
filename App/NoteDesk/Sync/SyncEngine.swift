@@ -329,13 +329,18 @@ final class SyncEngine {
         var booksByID = Dictionary(localBooks.map { ($0.remoteID, $0) }, uniquingKeysWith: { a, _ in a })
         for rb in remoteBooks {
             let stack = (rb.stack?.isEmpty ?? true) ? nil : rb.stack
-            if let lb = booksByID.removeValue(forKey: rb.id) {
+            let lb: LocalNotebook
+            if let existing = booksByID.removeValue(forKey: rb.id) {
+                lb = existing
                 if lb.title != rb.title { lb.title = rb.title }
                 if lb.ver != rb.ver { lb.ver = rb.ver }
                 if lb.stack != stack { lb.stack = stack }
             } else {
-                context.insert(LocalNotebook(remoteID: rb.id, title: rb.title, ver: rb.ver, stack: stack))
+                lb = LocalNotebook(remoteID: rb.id, title: rb.title, ver: rb.ver, stack: stack)
+                context.insert(lb)
             }
+            if lb.isPreset != rb.preset { lb.isPreset = rb.preset }
+            if lb.isArchived != rb.archive { lb.isArchived = rb.archive }
         }
         booksByID.values.forEach { context.delete($0) }
 
@@ -475,7 +480,9 @@ final class SyncEngine {
     // MARK: Локальные действия из UI
 
     func createNote(in notebookID: String?) -> LocalNote {
-        let defaultBook = notebookID ?? (try? context.fetch(FetchDescriptor<LocalNotebook>()))?.first?.remoteID
+        // Без выбранного блокнота — в записную книжку по умолчанию, как в Note Station
+        let books = (try? context.fetch(FetchDescriptor<LocalNotebook>())) ?? []
+        let defaultBook = notebookID ?? (books.first { $0.isPreset } ?? books.first)?.remoteID
         let n = LocalNote(notebookID: defaultBook, title: "", html: "<p><br></p>", isDirty: true)
         context.insert(n)
         try? context.save()
@@ -595,6 +602,55 @@ final class SyncEngine {
         try? context.save()
         refreshStats()
         scheduleSync(after: 0.5)
+    }
+
+    // MARK: Блокноты и стопки — действия из контекстного меню
+
+    /// Выполнить действие на сервере и сразу подтянуть изменения.
+    private func notebookAction(_ op: @escaping (NoteStation) async throws -> Void) async {
+        do {
+            try await authed(op)
+            await sync()
+        } catch {
+            phase = .error(Self.describe(error))
+        }
+    }
+
+    private func notebooks(inStack name: String) -> [String] {
+        ((try? context.fetch(FetchDescriptor<LocalNotebook>())) ?? []).filter { $0.stack == name }.map(\.remoteID)
+    }
+
+    func renameNotebook(id: String, title: String) async {
+        await notebookAction { try await $0.renameNotebook(id: id, title: title) }
+    }
+
+    /// stack: название стопки (новой или существующей); nil — «Удалить с полки».
+    func moveNotebook(id: String, toStack stack: String?) async {
+        await notebookAction { try await $0.setNotebookStack(id: id, stack: stack ?? "") }
+    }
+
+    func renameStack(_ name: String, to newName: String) async {
+        let ids = notebooks(inStack: name)
+        await notebookAction { api in for id in ids { try await api.setNotebookStack(id: id, stack: newName) } }
+    }
+
+    /// «Разобрать»: блокноты остаются, стопка исчезает.
+    func ungroupStack(_ name: String) async {
+        let ids = notebooks(inStack: name)
+        await notebookAction { api in for id in ids { try await api.setNotebookStack(id: id, stack: "") } }
+    }
+
+    func setPresetNotebook(id: String) async {
+        await notebookAction { try await $0.setPresetNotebook(id: id) }
+    }
+
+    func archiveNotebook(id: String, _ enable: Bool) async {
+        await notebookAction { try await $0.archiveNotebook(id: id, enable: enable) }
+    }
+
+    /// Заметки блокнота уходят в корзину Note Station.
+    func deleteNotebook(id: String) async {
+        await notebookAction { try await $0.deleteNotebook(id: id) }
     }
 
     func createNotebook(title: String) async {

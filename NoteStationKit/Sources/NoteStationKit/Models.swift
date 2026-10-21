@@ -6,6 +6,10 @@ public struct NSNotebook: Sendable, Hashable, Identifiable {
     public var ver: String?
     public var itemCount: Int?
     public var stack: String?
+    /// Записная книжка по умолчанию (новые заметки попадают сюда)
+    public var preset: Bool
+    /// В архиве — в Note Station показывается отдельно
+    public var archive: Bool
     public var ctime: Date?
     public var mtime: Date?
 
@@ -13,6 +17,8 @@ public struct NSNotebook: Sendable, Hashable, Identifiable {
         guard let id = v["object_id"]?.stringish else { return nil }
         self.id = id
         title = v["title"]?.string ?? ""
+        preset = v["preset"]?.bool ?? false
+        archive = v["archive"]?.bool ?? false
         ver = v["ver"]?.stringish
         itemCount = v["item_count"]?.int ?? v["items"]?.array?.count
         stack = v["stack"]?.string
