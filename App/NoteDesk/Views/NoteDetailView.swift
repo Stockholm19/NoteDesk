@@ -1,5 +1,12 @@
 import SwiftUI
 import SwiftData
+import NoteStationKit
+import UniformTypeIdentifiers
+#if os(macOS)
+import AppKit
+#else
+import UIKit
+#endif
 
 struct NoteDetailView: View {
     @Query private var match: [LocalNote]
@@ -26,6 +33,10 @@ struct NoteEditorView: View {
     @State private var title = ""
     @State private var images: [String: String] = [:]
     @State private var loadError: String?
+    @State private var attachments: [NSAttachment] = []
+    @State private var files: [EditorFile] = []
+    @AppStorage("editorFontSize") private var fontSize = 16
+    @AppStorage("spellcheck") private var spellcheck = true
     @FocusState private var titleFocused: Bool
 
     var body: some View {
@@ -42,7 +53,10 @@ struct NoteEditorView: View {
         .onChange(of: note.title) { _, new in
             if !titleFocused { title = new }   // обновилось с сервера
         }
-        .task(id: note.imageRefs) { await loadImageURLs() }
+        .task(id: note.imageRefs) {
+            await loadImageURLs()
+            await loadAttachments()
+        }
         .onDisappear {
             Task {
                 // flush вернёт nil, если правок не было
@@ -99,8 +113,13 @@ struct NoteEditorView: View {
         } else if let html = note.html {
             HTMLEditor(documentKey: note.localID, html: html, images: images, editable: true,
                        baseURL: engine.account?.serverURL, controller: controller,
+                       prefs: EditorPrefs(fontSize: fontSize, spellcheck: spellcheck),
+                       files: files,
                        onImage: { ref, name, mime, data in
                            engine.addImage(to: note, ref: ref, filename: name, mimeType: mime, data: data)
+                       },
+                       onFileAction: { action, ref, fileID in
+                           Task { await fileAction(action, ref: ref, fileID: fileID) }
                        }) { newHTML in
                 engine.edit(note, html: newHTML)
             }
@@ -141,6 +160,45 @@ struct NoteEditorView: View {
             .symbolVariant(controller.state[cmd] == true ? .fill : .none)
     }
 
+    /// Вложения вне текста. Так Note Station хранит «гифки» из Telegram:
+    /// статичная картинка в тексте и mp4 отдельным файлом.
+    private func loadAttachments() async {
+        guard note.remoteID != nil else { return }
+        let all = await engine.attachments(for: note)
+        guard !all.isEmpty else { return }
+        attachments = all
+        let html = note.html ?? ""
+        var out: [EditorFile] = []
+        for a in all where !(a.ref.map { html.contains($0) } ?? false) {
+            let ext = ((a.name ?? "") as NSString).pathExtension.lowercased()
+            let mime = ["mp4": "video/mp4", "m4v": "video/mp4", "mov": "video/quicktime", "webm": "video/webm"][ext]
+            // Короткие ролики (Telegram-«гифки») показываем прямо в заметке, большие — файлом
+            var data: Data?
+            if mime != nil, (a.size ?? 0) < 40_000_000 {
+                data = await engine.fileData(note: note, ref: nil, fileID: a.id)
+            }
+            out.append(EditorFile(id: a.id, name: a.name ?? "Файл", video: data != nil,
+                                  data: data?.base64EncodedString(), mime: mime))
+        }
+        files = out
+    }
+
+    private func fileName(ref: String?, fileID: String?, data: Data) -> String {
+        let fid = fileID ?? ref.flatMap { note.imageRefs[$0] }
+        if let name = attachments.first(where: { $0.id == fid })?.name, !name.isEmpty { return name }
+        return "image." + (FileKind.sniff(data)?.preferredFilenameExtension ?? "png")
+    }
+
+    private func fileAction(_ action: EditorFileAction, ref: String?, fileID: String?) async {
+        guard let data = await engine.fileData(note: note, ref: ref, fileID: fileID) else { return }
+        let name = fileName(ref: ref, fileID: fileID, data: data)
+        switch action {
+        case .copy: FileKind.copy(data, name: name)
+        case .save: FileKind.save(data, name: name)
+        case .open: FileKind.open(data, name: name)
+        }
+    }
+
     private func loadImageURLs() async {
         // Ещё не загруженные картинки — из локальной очереди, остальные — с NAS
         var map = engine.pendingImageURLs(for: note)
@@ -150,5 +208,69 @@ struct NoteEditorView: View {
             }
         }
         images = map
+    }
+}
+
+/// Копирование, сохранение и открытие файлов картинок и вложений.
+enum FileKind {
+    /// Тип по первым байтам: GIF должен остаться GIF, а не стать PNG.
+    static func sniff(_ d: Data) -> UTType? {
+        let b = [UInt8](d.prefix(12))
+        if b.starts(with: [0x47, 0x49, 0x46]) { return .gif }
+        if b.starts(with: [0x89, 0x50, 0x4E, 0x47]) { return .png }
+        if b.starts(with: [0xFF, 0xD8]) { return .jpeg }
+        if b.count >= 12, b[8...11].elementsEqual(Array("WEBP".utf8)) { return .webP }
+        if b.count >= 12, b[4...7].elementsEqual(Array("ftyp".utf8)) {
+            return String(decoding: b[8...11], as: UTF8.self).hasPrefix("hei") ? .heic : .mpeg4Movie
+        }
+        return nil
+    }
+
+    static func type(_ data: Data, name: String) -> UTType {
+        sniff(data) ?? UTType(filenameExtension: (name as NSString).pathExtension) ?? .data
+    }
+
+    static func copy(_ data: Data, name: String) {
+        let t = type(data, name: name)
+        #if os(macOS)
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        if t.conforms(to: .image), let img = NSImage(data: data) {
+            // Сама картинка (для любых приложений) плюс исходный файл — GIF останется анимированным
+            pb.writeObjects([img])
+            pb.setData(data, forType: NSPasteboard.PasteboardType(t.identifier))
+        } else {
+            let url = tempFile(data, name: name)
+            pb.writeObjects([url as NSURL])
+        }
+        #else
+        UIPasteboard.general.setData(data, forPasteboardType: t.identifier)
+        #endif
+    }
+
+    static func save(_ data: Data, name: String) {
+        #if os(macOS)
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = name
+        panel.canCreateDirectories = true
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        try? data.write(to: url)
+        #else
+        copy(data, name: name)
+        #endif
+    }
+
+    static func open(_ data: Data, name: String) {
+        #if os(macOS)
+        NSWorkspace.shared.open(tempFile(data, name: name))
+        #endif
+    }
+
+    private static func tempFile(_ data: Data, name: String) -> URL {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("NoteDesk", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let url = dir.appendingPathComponent(name.replacingOccurrences(of: "/", with: "_"))
+        try? data.write(to: url)
+        return url
     }
 }

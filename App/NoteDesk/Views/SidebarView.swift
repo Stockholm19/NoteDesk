@@ -4,12 +4,12 @@ import SwiftData
 struct SidebarView: View {
     @Environment(SyncEngine.self) private var engine
     @Binding var selection: SidebarItem?
+    var onCreate: (CreateRequest) -> Void = { _ in }
     @Query(sort: [SortDescriptor(\LocalNotebook.title, comparator: .localizedStandard)]) private var notebooks: [LocalNotebook]
     @AppStorage("expandedStacks") private var expandedRaw = ""
     @AppStorage("expandedSections") private var sectionsRaw = "books,fav,tags"
-    @State private var newNotebook = false
-    @State private var newNotebookTitle = ""
     @State private var confirmLogout = false
+    @State private var showSettings = false
     // Диалоги контекстного меню
     @State private var prompt: Prompt?
     @State private var promptText = ""
@@ -93,12 +93,13 @@ struct SidebarView: View {
 
             if !engine.stats.tags.isEmpty {
                 Section("Теги", isExpanded: sectionBinding("tags")) {
-                    ForEach(engine.stats.tags, id: \.self) { t in
-                        Label(t, systemImage: "tag")
-                            .tag(SidebarItem.tag(t))
-                            .entryContextMenu { [favoriteEntry(category: "tag", key: t)] }
-                    }
+                    ForEach(TagNode.tree(engine.stats.tags)) { TagRow(node: $0) }
                 }
+            }
+
+            Section {
+                Label("Корзина", systemImage: "trash")
+                    .tag(SidebarItem.trash)
             }
         }
         .listStyle(.sidebar)
@@ -108,8 +109,14 @@ struct SidebarView: View {
             ToolbarItem { SyncStatusButton() }
             ToolbarItem {
                 Menu {
-                    Button("Новый блокнот…", systemImage: "book.closed") { newNotebook = true }
+                    Button("Создать записную книгу…", systemImage: "book.closed") { onCreate(.notebook) }
+                    Button("Создать полку…", systemImage: "books.vertical") { onCreate(.shelf) }
                     Divider()
+                    #if os(iOS)
+                    Button("Настройки", systemImage: "gearshape") { showSettings = true }
+                    #else
+                    SettingsLink { Label("Настройки…", systemImage: "gearshape") }
+                    #endif
                     if let acc = engine.account {
                         Text("\(acc.username) @ \(acc.serverURL.host() ?? "")")
                     }
@@ -125,15 +132,8 @@ struct SidebarView: View {
                 }
             }
         }
-        .alert("Новый блокнот", isPresented: $newNotebook) {
-            TextField("Название", text: $newNotebookTitle)
-            Button("Создать") {
-                let t = newNotebookTitle.trimmingCharacters(in: .whitespaces)
-                newNotebookTitle = ""
-                guard !t.isEmpty else { return }
-                Task { await engine.createNotebook(title: t) }
-            }
-            Button("Отмена", role: .cancel) { newNotebookTitle = "" }
+        .sheet(isPresented: $showSettings) {
+            NavigationStack { SettingsView() }
         }
         .alert(prompt?.title ?? "", isPresented: Binding(get: { prompt != nil }, set: { if !$0 { prompt = nil } })) {
             TextField("Название", text: $promptText)
@@ -349,5 +349,72 @@ struct SyncStatusLine: View {
             Label("Синхронизировано в \(d.formatted(date: .omitted, time: .shortened))", systemImage: "checkmark.icloud")
                 .foregroundStyle(.secondary)
         }
+    }
+}
+
+/// Теги Note Station с «/» в названии — дерево, как в оригинале.
+struct TagNode: Identifiable {
+    var path: String
+    var name: String
+    var children: [TagNode] = []
+    var id: String { path }
+
+    static func tree(_ tags: [String]) -> [TagNode] {
+        final class Box { var name: String; var path: String; var kids: [String: Box] = [:]
+            init(_ n: String, _ p: String) { name = n; path = p } }
+        let root = Box("", "")
+        for t in tags {
+            var node = root
+            var path = ""
+            for part in t.split(separator: "/", omittingEmptySubsequences: true).map(String.init) {
+                path = path.isEmpty ? part : path + "/" + part
+                if node.kids[part] == nil { node.kids[part] = Box(part, path) }
+                node = node.kids[part]!
+            }
+        }
+        func build(_ b: Box) -> [TagNode] {
+            b.kids.values
+                .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+                .map { TagNode(path: $0.path, name: $0.name, children: build($0)) }
+        }
+        return build(root)
+    }
+}
+
+private struct TagRow: View {
+    @Environment(SyncEngine.self) private var engine
+    let node: TagNode
+    @AppStorage("expandedTags") private var expandedRaw = ""
+
+    var body: some View {
+        if node.children.isEmpty {
+            label
+        } else {
+            DisclosureGroup(isExpanded: expanded) {
+                ForEach(node.children) { TagRow(node: $0) }
+            } label: { label }
+        }
+    }
+
+    private var label: some View {
+        Label(node.name, systemImage: node.children.isEmpty ? "tag" : "tag.fill")
+            .badge(engine.stats.tagCounts[node.path] ?? 0)
+            .tag(SidebarItem.tag(node.path))
+            .entryContextMenu {
+                let fav = engine.isFavorite(category: "tag", key: node.path)
+                return [.action(fav ? "Убрать из Избранного" : "Добавить в Избранное", fav ? "star.slash" : "star") {
+                    Task { await engine.setFavorite(!fav, category: "tag", key: node.path) }
+                }]
+            }
+    }
+
+    private var expanded: Binding<Bool> {
+        Binding(
+            get: { expandedRaw.split(separator: "\n").contains(Substring(node.path)) },
+            set: { on in
+                var s = Set(expandedRaw.split(separator: "\n").map(String.init))
+                if on { s.insert(node.path) } else { s.remove(node.path) }
+                expandedRaw = s.sorted().joined(separator: "\n")
+            })
     }
 }

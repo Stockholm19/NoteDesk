@@ -44,12 +44,20 @@ struct NoteDeskApp: App {
                 }
             }
         }
+        #if os(macOS)
+        Settings {
+            SettingsView()
+                .environment(engine)
+                .modelContainer(container)
+        }
+        #endif
     }
 }
 
 struct RootView: View {
     @Environment(SyncEngine.self) private var engine
     @Environment(\.scenePhase) private var scenePhase
+    @AppStorage("syncInterval") private var syncInterval = 60
 
     var body: some View {
         Group {
@@ -59,13 +67,14 @@ struct RootView: View {
                 LoginView()
             }
         }
-        .task(id: engine.isLoggedIn) {
-            // Фоновая синхронизация раз в минуту, пока приложение на экране
+        .task(id: "\(engine.isLoggedIn)-\(syncInterval)") {
+            // Фоновая синхронизация с интервалом из настроек, пока приложение на экране
             guard engine.isLoggedIn else { return }
             await engine.sync()
+            guard syncInterval > 0 else { return }
             while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(60))
-                if scenePhase == .active { await engine.sync() }
+                try? await Task.sleep(for: .seconds(syncInterval))
+                if !Task.isCancelled && scenePhase == .active { await engine.sync() }
             }
         }
         .onChange(of: scenePhase) { _, phase in

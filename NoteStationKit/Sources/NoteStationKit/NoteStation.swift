@@ -217,6 +217,38 @@ public actor NoteStation {
         ])
     }
 
+    // MARK: Корзина
+
+    /// Заметки в корзине (без тела) — тот же Note.list, но с filter.recycle.
+    public func trashedNotes(pageSize: Int = 200) async throws -> [NSNote] {
+        var result: [NSNote] = []
+        var offset = 0
+        while true {
+            let data = try await dsm.call("SYNO.NoteStation.Note", "list", version: 3, [
+                "offset": .int(offset), "limit": .int(pageSize),
+                "sort_by": "mtime", "sort_direction": "desc",
+                "filter": ["recycle": true],
+            ])
+            let raw = data.firstList(preferring: ["notes", "note", "list"])
+            result += raw.compactMap(NSNote.init)
+            offset += raw.count
+            if raw.count < pageSize { break }
+        }
+        return result
+    }
+
+    /// Вернуть из корзины — заметка возвращается в свою записную книгу (проверено).
+    public func restoreNote(id: String) async throws {
+        _ = try await dsm.call("SYNO.NoteStation.Note", "restore", version: 3, ["object_id": .string(id)])
+    }
+
+    /// Удалить навсегда заметку, которая уже лежит в корзине.
+    public func deleteNotePermanently(id: String) async throws {
+        _ = try await dsm.call("SYNO.NoteStation.Note", "delete", version: 3, [
+            "object_id": .string(id), "recycle": false,
+        ])
+    }
+
     // MARK: Вложения
 
     /// URL вложения для WKWebView (с _sid в query).

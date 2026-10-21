@@ -22,6 +22,25 @@ final class EditorController {
     }
 }
 
+/// Вложение заметки, которого нет в тексте: видео (вместо GIF) или файл.
+struct EditorFile: Encodable, Equatable {
+    var id: String
+    var name: String
+    var video: Bool
+    /// Видео целиком (base64): по прямой ссылке на NAS WebKit показывал чёрный кадр.
+    var data: String?
+    var mime: String?
+}
+
+/// Что сделать с картинкой или вложением из контекстного меню.
+enum EditorFileAction { case copy, save, open }
+
+/// Настройки отображения из окна «Настройки».
+struct EditorPrefs: Equatable {
+    var fontSize = 16
+    var spellcheck = true
+}
+
 /// WKWebView с contenteditable. `documentKey` — идентичность документа:
 /// при его смене содержимое перезагружается полностью.
 struct HTMLEditor {
@@ -31,8 +50,12 @@ struct HTMLEditor {
     var editable: Bool
     var baseURL: URL?
     var controller: EditorController
+    var prefs = EditorPrefs()
+    var files: [EditorFile] = []
     /// Вставлена картинка: ref, имя файла, MIME, данные.
     var onImage: (String, String, String, Data) -> Void = { _, _, _, _ in }
+    /// Действие над картинкой (ref) или вложением (id файла).
+    var onFileAction: (EditorFileAction, _ ref: String?, _ fileID: String?) -> Void = { _, _, _ in }
     var onChange: (String) -> Void
 
     func makeCoordinator() -> Coordinator { Coordinator(onChange: onChange) }
@@ -40,6 +63,11 @@ struct HTMLEditor {
     fileprivate func makeWebView(_ c: Coordinator) -> WKWebView {
         let config = WKWebViewConfiguration()
         config.userContentController.add(WeakHandler(c), name: "nd")
+        // Видео-вложения играют сами, как GIF (без звука)
+        config.mediaTypesRequiringUserActionForPlayback = []
+        #if os(iOS)
+        config.allowsInlineMediaPlayback = true
+        #endif
         let wv = WKWebView(frame: .zero, configuration: config)
         wv.navigationDelegate = c
         #if DEBUG
@@ -62,15 +90,21 @@ struct HTMLEditor {
     fileprivate func update(_ c: Coordinator) {
         c.onChange = onChange
         c.onImage = onImage
+        c.onFileAction = onFileAction
         controller.webView = c.webView
         c.controller = controller
         c.apply(key: documentKey, html: html, images: images, editable: editable)
+        c.applyExtras(prefs: prefs, files: files)
     }
 
     final class Coordinator: NSObject, WKNavigationDelegate, WKScriptMessageHandler {
         var onChange: (String) -> Void
         var onImage: (String, String, String, Data) -> Void = { _, _, _, _ in }
+        var onFileAction: (EditorFileAction, String?, String?) -> Void = { _, _, _ in }
         weak var webView: WKWebView?
+        private var appliedPrefs: EditorPrefs?
+        private var appliedFiles: [EditorFile]?
+        private var wantedExtras: (EditorPrefs, [EditorFile])?
         weak var controller: EditorController?
         private var ready = false
         private var loadedKey: UUID?
@@ -98,6 +132,18 @@ struct HTMLEditor {
             webView.evaluateJavaScript("nd.setEditable(\(editable))")
         }
 
+        func applyExtras(prefs: EditorPrefs, files: [EditorFile]) {
+            guard ready, let webView else { wantedExtras = (prefs, files); return }
+            if prefs != appliedPrefs {
+                appliedPrefs = prefs
+                webView.evaluateJavaScript("nd.setPrefs(\(prefs.fontSize), \(prefs.spellcheck))")
+            }
+            if files != appliedFiles {
+                appliedFiles = files
+                webView.evaluateJavaScript("nd.setFiles(\(Self.js(files)))")
+            }
+        }
+
         func userContentController(_ ucc: WKUserContentController, didReceive message: WKScriptMessage) {
             guard let body = message.body as? [String: Any], let type = body["type"] as? String else { return }
             switch type {
@@ -107,6 +153,7 @@ struct HTMLEditor {
                 editorLog.debug("editor ready, pending=\(self.pending != nil, privacy: .public)")
                 ready = true
                 if let p = pending { pending = nil; apply(key: p.0, html: p.1, images: p.2, editable: p.3) }
+                if let x = wantedExtras { wantedExtras = nil; applyExtras(prefs: x.0, files: x.1) }
             case "changed":
                 guard let html = body["body"] as? String, html != knownHTML else { return }
                 knownHTML = html
@@ -119,7 +166,61 @@ struct HTMLEditor {
                 onImage(ref, name, mime, data)
             case "state":
                 controller?.state = (body["body"] as? [String: Bool]) ?? [:]
+            case "menu":
+                guard let b = body["body"] as? [String: Any] else { return }
+                showMenu(ref: b["ref"] as? String, fileID: b["file"] as? String,
+                         x: (b["x"] as? Double) ?? 0, y: (b["y"] as? Double) ?? 0)
+            case "openFile":
+                if let id = body["body"] as? String { onFileAction(.open, nil, id) }
+            case "fetchImage":
+                if let s = body["body"] as? String, let url = URL(string: s) { Task { await insertRemoteImage(url) } }
             default: break
+            }
+        }
+
+        /// Меню картинки чуть правее и ниже курсора — как в сайдбаре.
+        private func showMenu(ref: String?, fileID: String?, x: Double, y: Double) {
+            #if os(macOS)
+            guard let webView else { return }
+            let menu = NSMenu()
+            let isImage = ref != nil
+            func item(_ title: String, _ icon: String, _ action: EditorFileAction) {
+                let it = NSMenuItem(title: title, action: #selector(menuFired(_:)), keyEquivalent: "")
+                it.target = self
+                it.image = NSImage(systemSymbolName: icon, accessibilityDescription: nil)
+                it.representedObject = MenuPayload(action: action, ref: ref, fileID: fileID)
+                menu.addItem(it)
+            }
+            item(isImage ? "Скопировать изображение" : "Скопировать файл", "doc.on.doc", .copy)
+            item("Сохранить как…", "square.and.arrow.down", .save)
+            item("Открыть", "arrow.up.forward.app", .open)
+            let p = NSPoint(x: x + 14, y: webView.isFlipped ? y + 6 : webView.bounds.height - y - 6)
+            menu.popUp(positioning: nil, at: p, in: webView)
+            #endif
+        }
+
+        private final class MenuPayload {
+            let action: EditorFileAction; let ref: String?; let fileID: String?
+            init(action: EditorFileAction, ref: String?, fileID: String?) { self.action = action; self.ref = ref; self.fileID = fileID }
+        }
+
+        @objc private func menuFired(_ sender: AnyObject) {
+            #if os(macOS)
+            guard let p = (sender as? NSMenuItem)?.representedObject as? MenuPayload else { return }
+            onFileAction(p.action, p.ref, p.fileID)
+            #endif
+        }
+
+        /// GIF по ссылке из браузера: в буфере он уже статичный, поэтому качаем оригинал.
+        private func insertRemoteImage(_ url: URL) async {
+            do {
+                let (data, response) = try await URLSession.shared.data(from: url)
+                let mime = (response as? HTTPURLResponse)?.mimeType ?? "image/gif"
+                guard mime.hasPrefix("image/"), data.count < 25_000_000 else { return }
+                let name = url.lastPathComponent.isEmpty ? "image.gif" : url.lastPathComponent
+                _ = try? await webView?.evaluateJavaScript("nd.insertFile(\(Self.js(data.base64EncodedString())), \(Self.js(mime)), \(Self.js(name)))")
+            } catch {
+                editorLog.error("fetch image: \(error.localizedDescription, privacy: .public)")
             }
         }
 

@@ -35,14 +35,19 @@ struct NoteListView: View {
     let filter: SidebarItem
     @Binding var selection: UUID?
     @Binding var sort: NoteSort
+    var onCreate: (CreateRequest) -> Void = { _ in }
+    var onNewNoteIn: (String) -> Void = { _ in }
     @Query private var allNotes: [LocalNote]
     @Query(sort: \LocalNotebook.title) private var notebooks: [LocalNotebook]
     @State private var search = ""
 
-    init(filter: SidebarItem, selection: Binding<UUID?>, sort: Binding<NoteSort>) {
+    init(filter: SidebarItem, selection: Binding<UUID?>, sort: Binding<NoteSort>,
+         onCreate: @escaping (CreateRequest) -> Void = { _ in }, onNewNoteIn: @escaping (String) -> Void = { _ in }) {
         self.filter = filter
         _selection = selection
         _sort = sort
+        self.onCreate = onCreate
+        self.onNewNoteIn = onNewNoteIn
         _allNotes = Query(filter: #Predicate<LocalNote> { !$0.isTrashedLocally }, sort: sort.wrappedValue.descriptors)
     }
 
@@ -89,9 +94,15 @@ struct NoteListView: View {
                 .help(sort.label)
             }
             ToolbarItem(placement: .primaryAction) {
-                Button("Новая заметка", systemImage: "square.and.pencil") { newNote() }
-                    .keyboardShortcut("n", modifiers: .command)
+                CreateMenu(newNote: newNote, newNoteIn: onNewNoteIn, create: onCreate)
             }
+        }
+        // ⌘N — у меню с основной кнопкой своего сочетания нет
+        .background {
+            Button("Новая заметка", action: newNote)
+                .keyboardShortcut("n", modifiers: .command)
+                .opacity(0)
+                .accessibilityHidden(true)
         }
         #if os(macOS)
         .onDeleteCommand {
@@ -143,8 +154,15 @@ struct NoteListView: View {
         case .stack(let name):
             let ids = Set(notebooks.filter { $0.stack == name }.map(\.remoteID))
             scoped = allNotes.filter { $0.notebookID.map(ids.contains) ?? false }
-        case .tag(let t): scoped = allNotes.filter { $0.tags.contains(t) }
+        case .tag(let t):
+            // Тег-«папка», которого нет на заметках сам по себе, показывает заметки вложенных тегов
+            if engine.stats.tagCounts[t] != nil {
+                scoped = allNotes.filter { $0.tags.contains(t) }
+            } else {
+                scoped = allNotes.filter { $0.tags.contains { $0.hasPrefix(t + "/") } }
+            }
         case .note(let rid): scoped = allNotes.filter { $0.remoteID == rid }
+        case .trash: scoped = []
         }
         let q = search.trimmingCharacters(in: .whitespaces)
         guard !q.isEmpty else { return scoped }
@@ -159,8 +177,9 @@ struct NoteListView: View {
         case .all: "Все заметки"
         case .notebook(let id): notebookTitle(id) ?? "Блокнот"
         case .stack(let name): name
-        case .tag(let t): "#\(t)"
+        case .tag(let t): "#\(t.split(separator: "/").last.map(String.init) ?? t)"
         case .note: "Избранное"
+        case .trash: "Корзина"
         }
     }
 

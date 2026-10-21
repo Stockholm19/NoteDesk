@@ -16,7 +16,7 @@ enum EditorPage {
   html, body { margin: 0; padding: 0; }
   body {
     font-family: -apple-system, system-ui, sans-serif;
-    font-size: 16px; line-height: 1.4;
+    font-size: var(--nd-size, 16px); line-height: 1.4;
     padding: 12px 20px 80px;
     word-wrap: break-word;
     -webkit-user-select: text;
@@ -51,6 +51,15 @@ enum EditorPage {
     background-color: -apple-system-blue; border-color: -apple-system-blue;
     background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'%3E%3Cpath d='M2 6.5l2.5 2.5L10 3' fill='none' stroke='white' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
   }
+
+  /* Вложения, которых нет в тексте (видео, файлы) — под заметкой, в неё не попадают */
+  #nd-files { margin-top: 24px; display: none; flex-wrap: wrap; gap: 10px; -webkit-user-select: none; }
+  #nd-files.on { display: flex; }
+  #nd-files video { max-width: min(100%, 420px); border-radius: 8px; display: block; background: #000; }
+  #nd-files .nd-file { display: inline-flex; align-items: center; gap: 6px; padding: 6px 10px; border-radius: 8px;
+    background: rgba(128,128,128,.12); font-size: 13px; cursor: pointer; max-width: 100%; }
+  #nd-files .nd-file span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #nd-files .nd-file:hover { background: rgba(128,128,128,.2); }
 
   /* Рамка и панель размера картинки — вне #ed, в заметку не попадают */
   #nd-imgsel { position: absolute; display: none; pointer-events: none;
@@ -91,6 +100,7 @@ enum EditorPage {
 </head>
 <body>
 <div id="ed" contenteditable="true" data-placeholder="Текст заметки"></div>
+<div id="nd-files" contenteditable="false"></div>
 <div id="nd-imgsel"><div class="nd-h" data-c="nw"></div><div class="nd-h" data-c="ne"></div><div class="nd-h" data-c="sw"></div><div class="nd-h" data-c="se"></div></div>
 <div id="nd-imgbar" contenteditable="false">
   <button data-a="minus" title="Меньше">−</button>
@@ -401,7 +411,22 @@ enum EditorPage {
     return [...(list || [])].filter(f => f.type && f.type.startsWith('image/'));
   }
 
+  // Анимированный GIF из браузера в буфер попадает уже статичной PNG,
+  // а рядом — HTML со ссылкой на оригинал. Такой файл скачивает приложение.
+  function gifURL(html, uris) {
+    let url = null;
+    if (html) {
+      const doc = new DOMParser().parseFromString(html, 'text/html');
+      const imgs = doc.querySelectorAll('img[src]');
+      if (imgs.length === 1) url = imgs[0].getAttribute('src');
+    }
+    if (!url && uris) url = uris.split(/\r?\n/).find(u => u && !u.startsWith('#'));
+    return url && /^https?:\/\/.+\.gif(\?|#|$)/i.test(url) ? url : null;
+  }
+
   ed.addEventListener('paste', e => {
+    const gif = gifURL(e.clipboardData.getData('text/html'), null);
+    if (gif) { e.preventDefault(); post('fetchImage', gif); return; }
     const files = imageFiles(e.clipboardData.files);
     if (files.length) {           // картинка из буфера (скриншот, Превью, браузер)
       e.preventDefault();
@@ -425,11 +450,27 @@ enum EditorPage {
   });
   ed.addEventListener('drop', e => {
     const files = imageFiles(e.dataTransfer.files);
-    if (!files.length) return;
+    const gif = files.some(f => f.type === 'image/gif') ? null
+      : gifURL(e.dataTransfer.getData('text/html'), e.dataTransfer.getData('text/uri-list'));
+    if (!files.length && !gif) return;
     e.preventDefault();
     const r = document.caretRangeFromPoint && document.caretRangeFromPoint(e.clientX, e.clientY);
     if (r) { const s = window.getSelection(); s.removeAllRanges(); s.addRange(r); }
-    insertImages(files);
+    if (gif) post('fetchImage', gif); else insertImages(files);
+  });
+
+  // Правый клик по картинке или вложению — своё меню приложения (скопировать, сохранить)
+  document.addEventListener('contextmenu', e => {
+    const t = e.target.closest('img[ref], video[data-file], .nd-file');
+    if (!t) return;
+    e.preventDefault();
+    post('menu', { ref: t.getAttribute('ref'), file: t.getAttribute('data-file'), x: e.clientX, y: e.clientY });
+  });
+
+  const filesBox = document.getElementById('nd-files');
+  filesBox.addEventListener('click', e => {
+    const f = e.target.closest('.nd-file');
+    if (f) post('openFile', f.getAttribute('data-file'));
   });
 
   document.addEventListener('selectionchange', () => {
@@ -457,6 +498,39 @@ enum EditorPage {
       setTimeout(() => { suppress = false; }, 0);
     },
     setEditable(on) { ed.setAttribute('contenteditable', on ? 'true' : 'false'); },
+    setPrefs(size, spell) {
+      document.documentElement.style.setProperty('--nd-size', size + 'px');
+      ed.setAttribute('spellcheck', spell ? 'true' : 'false');
+    },
+    // Вложения вне текста: видео играет само по кругу без звука (как GIF), остальное — плашкой
+    setFiles(list) {
+      filesBox.textContent = '';
+      (list || []).forEach(f => {
+        if (f.video && f.data) {
+          const bytes = Uint8Array.from(atob(f.data), c => c.charCodeAt(0));
+          const v = document.createElement('video');
+          Object.assign(v, { src: URL.createObjectURL(new Blob([bytes], { type: f.mime || 'video/mp4' })),
+                             autoplay: true, loop: true, muted: true, playsInline: true, controls: false });
+          v.setAttribute('data-file', f.id);
+          v.title = f.name;
+          v.addEventListener('error', () => post('log', 'video ' + f.name + ': error ' + (v.error && v.error.code)));
+          filesBox.appendChild(v);
+        } else {
+          const d = document.createElement('div');
+          d.className = 'nd-file';
+          d.setAttribute('data-file', f.id);
+          d.innerHTML = '📎 <span></span>';
+          d.querySelector('span').textContent = f.name;
+          filesBox.appendChild(d);
+        }
+      });
+      filesBox.classList.toggle('on', filesBox.childElementCount > 0);
+    },
+    // Картинка, которую скачало приложение (GIF по ссылке)
+    async insertFile(b64, mime, name) {
+      const blob = await (await fetch('data:' + mime + ';base64,' + b64)).blob();
+      insertImages([new File([blob], name, { type: mime })]);
+    },
     exec(cmd, value) {
       ed.focus();
       if (cmd === 'heading') document.execCommand('formatBlock', false, value);

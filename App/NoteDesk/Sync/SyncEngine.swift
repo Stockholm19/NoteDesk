@@ -23,7 +23,7 @@ final class SyncEngine {
     private(set) var account: Account?
     /// Счётчики для сайдбара. Считаются после синхронизации, а не в body вьюхи:
     /// перебор 2000 моделей на каждую перерисовку грузил главный поток.
-    struct Stats { var total = 0; var counts: [String: Int] = [:]; var tags: [String] = [] }
+    struct Stats { var total = 0; var counts: [String: Int] = [:]; var tags: [String] = []; var tagCounts: [String: Int] = [:] }
     private(set) var stats = Stats()
 
     /// Ярлык «Избранного» из Note Station.
@@ -63,12 +63,11 @@ final class SyncEngine {
         d.propertiesToFetch = [\.notebookID, \.tags]
         let notes = (try? context.fetch(d)) ?? []
         var s = Stats(total: notes.count)
-        var tags = Set<String>()
         for n in notes {
             if let nb = n.notebookID { s.counts[nb, default: 0] += 1 }
-            tags.formUnion(n.tags)
+            for t in n.tags { s.tagCounts[t, default: 0] += 1 }
         }
-        s.tags = tags.sorted { $0.localizedStandardCompare($1) == .orderedAscending }
+        s.tags = s.tagCounts.keys.sorted { $0.localizedStandardCompare($1) == .orderedAscending }
         stats = s
     }
 
@@ -653,13 +652,67 @@ final class SyncEngine {
         await notebookAction { try await $0.deleteNotebook(id: id) }
     }
 
-    func createNotebook(title: String) async {
+    /// Новая записная книга; stack — сразу положить на полку.
+    @discardableResult
+    func createNotebook(title: String, stack: String? = nil) async -> String? {
         do {
             let nb = try await authed { try await $0.createNotebook(title: title) }
-            context.insert(LocalNotebook(remoteID: nb.id, title: nb.title, ver: nb.ver))
+            if let stack, !stack.isEmpty {
+                try await authed { try await $0.setNotebookStack(id: nb.id, stack: stack) }
+            }
+            context.insert(LocalNotebook(remoteID: nb.id, title: nb.title, ver: nb.ver, stack: stack))
             try? context.save()
+            await sync()
+            return nb.id
         } catch {
             phase = .error(Self.describe(error))
+            return nil
         }
+    }
+
+    /// «Создать полку»: в Note Station полка живёт, пока в ней есть книги,
+    /// поэтому создаём её, перекладывая выбранные книги.
+    func createShelf(name: String, notebookIDs: [String]) async {
+        await notebookAction { api in for id in notebookIDs { try await api.setNotebookStack(id: id, stack: name) } }
+    }
+
+    // MARK: Корзина — живёт на сервере, локально не хранится
+
+    func trashedNotes() async throws -> [NSNote] {
+        try await authed { try await $0.trashedNotes() }
+    }
+
+    func restore(_ ids: [String]) async throws {
+        try await authed { api in for id in ids { try await api.restoreNote(id: id) } }
+        await sync()
+    }
+
+    func deleteForever(_ ids: [String]) async throws {
+        try await authed { api in for id in ids { try await api.deleteNotePermanently(id: id) } }
+    }
+
+    /// Тело заметки из корзины — только для просмотра.
+    func remoteNote(id: String) async throws -> NSNote {
+        try await authed { try await $0.note(id: id) }
+    }
+
+    // MARK: Вложения
+
+    /// Список вложений заметки с сервера (картинки в тексте и прочие файлы).
+    func attachments(for note: LocalNote) async -> [NSAttachment] {
+        guard let id = note.remoteID else { return [] }
+        return (try? await authed { try await $0.note(id: id) })?.attachments ?? []
+    }
+
+    func attachmentURL(noteID: String, fileID: String) async -> URL? {
+        try? await authed { try await $0.attachmentURL(noteID: noteID, fileID: fileID) }
+    }
+
+    /// Файл картинки или вложения — для копирования и сохранения.
+    /// ref — картинка из текста; fileID — вложение по id.
+    func fileData(note: LocalNote, ref: String?, fileID: String?) async -> Data? {
+        if let ref, let p = pendingAttachments(for: note.localID).first(where: { $0.ref == ref }) { return p.data }
+        guard let noteID = note.remoteID, let fid = fileID ?? ref.flatMap({ note.imageRefs[$0] }) else { return nil }
+        return try? await authed { try await $0.attachmentData(noteID: noteID, fileID: fid) }
     }
 }
