@@ -1,45 +1,83 @@
 # NoteDesk
 
-Клиент Synology Note Station для macOS и iOS (SwiftUI), работает с локальной копией заметок и синхронизирует её с NAS.
+An unofficial native client for **Synology Note Station** on macOS and iOS, built with SwiftUI.
 
-## Структура
+NoteDesk keeps a local copy of your notes and syncs it with Note Station on your own Synology NAS. You can read and edit notes offline, and changes go to the server on the next sync.
 
-- `NoteStationKit/` — Swift-пакет: клиент DSM Web API и Note Station API, без зависимостей.
-  - `nsctl` — консольная утилита для отладки API (`.build/debug/nsctl` без аргументов выводит список команд).
-- `App/` — мультиплатформенное приложение (один таргет на Mac и iOS).
-  - `Sync/SyncEngine.swift` — синхронизация: push локальных правок → pull изменений с сервера.
-  - `Editor/` — редактор: WKWebView с contenteditable поверх родного HTML Note Station.
-  - `Store/LocalModels.swift` — SwiftData-модели локальной копии.
+> **Unofficial project.** NoteDesk is not affiliated with, endorsed by, or supported by Synology Inc. "Synology" and "Note Station" are trademarks of Synology Inc. NoteDesk uses Note Station's undocumented web API, so a Note Station update can break it at any time.
 
-Сборка: открыть `App/NoteDesk.xcodeproj`, схема NoteDesk, выбрать Mac или iPhone.
-Пакет из терминала собирать через `xcrun swift build`: swiftly-тулчейн в PATH не совпадает с SDK Xcode.
+## Features
 
-## Note Station API (снято с notestation.js 2.6.10, проверено на живом NAS)
+- **Two-way sync** with Note Station: create, edit, move and delete notes; changes made in the web UI or DS note show up here.
+- **Offline first**: notes are stored locally with SwiftData; edits are queued and pushed when the NAS is reachable.
+- **Safe conflicts**: if a note was changed elsewhere, the server version is kept and your version is saved as a separate "(conflict)" note. Nothing is overwritten.
+- **Native HTML editor** that keeps Note Station's own markup: formatting, lists, code blocks, Note Station-compatible checkboxes.
+- **Images**: inline images from the NAS, paste or drag-and-drop new ones (uploaded as note attachments), resize by dragging a corner or with presets. Sizes are stored the same way Note Station stores them.
+- **Notebook stacks and Favorites** like in Note Station, tags, search, sorting by modified/created date or title, month sections.
+- **Two-factor authentication** with a trusted-device token, so you are not asked for a code on every re-login.
 
-Все вызовы идут через `POST /webapi/entry.cgi`. У API Note Station `requestFormat=JSON`, поэтому каждое значение параметра передаётся как JSON-текст: строка — `"\"abc\""`, bool — `true`.
+Not supported yet: encrypted notes (shown as locked), editing tags, non-image attachments, the trash.
 
-| Действие | API / метод / версия | Параметры |
+## Requirements
+
+- Synology DSM 7.x with Note Station 2.6 (tested with 2.6.10)
+- macOS 14+ / iOS 17+
+- Xcode 26+ to build
+
+## Building
+
+1. Open `App/NoteDesk.xcodeproj`.
+2. In **Signing & Capabilities**, select your own team and change the bundle identifier.
+3. Choose **My Mac** or an iPhone and press Run.
+
+`NoteStationKit` is a local Swift package with the API client and a small CLI, `nsctl`, for poking the API:
+
+```sh
+cd NoteStationKit
+xcrun swift build --product nsctl
+.build/debug/nsctl login http://192.168.1.10:5000 admin
+.build/debug/nsctl notebooks
+.build/debug/nsctl notes 20
+```
+
+The session is stored in `~/Library/Application Support/NoteDesk/nsctl-session.json` (mode 600). The app stores credentials in the Keychain.
+
+## Project layout
+
+```
+App/                      SwiftUI app (one target for macOS and iOS)
+  NoteDesk/Sync/          SyncEngine: push local edits, then pull server changes
+  NoteDesk/Editor/        WKWebView-based contenteditable editor
+  NoteDesk/Store/         SwiftData models of the local copy
+  NoteDesk/Views/         Sidebar, note list, note editor, login
+NoteStationKit/           Swift package: DSM / Note Station API client, nsctl
+```
+
+## Note Station API notes
+
+Reverse-engineered from the Note Station 2.6 web UI and verified against a live NAS.
+
+All calls are `POST /webapi/entry.cgi`. Note Station APIs use `requestFormat=JSON`, so **every parameter value is sent as JSON text**: a string `abc` is sent as `"abc"`, a boolean as `true`.
+
+| Action | API / method / version | Parameters |
 |---|---|---|
-| Блокноты | `Notebook.list` v2 | — |
-| Создать блокнот | `Notebook.create` v2 | `title`, `commit_msg` |
-| Заметки | `Note.list` v3 | `offset`, `limit` — **`total` в ответе = размер страницы**, листать до неполной страницы. Тегов в списке нет |
-| Заметка | `Note.get` v3 | `object_id` → `content` (HTML), `tag[]`, `attachment{file_id: {ref, type, …}}`, `ver` |
-| Создать | `Note.create` v3 | `title`, `parent_id`, `content`, `brief`, `commit_msg` |
-| Изменить | `Note.set` v3 | `object_id`, `ver`, `check_conflict: true`, … → ошибка **1064**, если `ver` устарела |
-| В корзину | `Note.delete` v3 | `object_id`, `recycle: true` (флаг `recycle` в `Note.set` игнорируется) |
-| Вложение | `Note.download` v3 (GET) | `object_id`, `file_id`, `format: "raw"` |
+| Notebooks | `Notebook.list` v2 | — (each notebook has a `stack` name) |
+| Create notebook | `Notebook.create` v2 | `title`, `commit_msg` |
+| Notes | `Note.list` v3 | `offset`, `limit` — **`total` is the page size, not the overall count**; page until a short page. Tags are not included |
+| Note | `Note.get` v3 | `object_id` → `content` (HTML), `tag[]`, `attachment{file_id: {ref, type, …}}`, `ver` |
+| Create | `Note.create` v3 | `title`, `parent_id`, `content`, `brief`, `commit_msg` |
+| Update | `Note.set` v3 | `object_id`, `ver`, `check_conflict: true`, … → error **1064** if `ver` is stale |
+| Update with images | `Note.set` v3, multipart | as above plus `attachment: [{action: "create", format: "raw", name, ref}]` and the files |
+| Move to trash | `Note.delete` v3 | `object_id`, `recycle: true` (`recycle` in `Note.set` is ignored) |
+| Attachment | `Note.download` v3 (GET) | `object_id`, `file_id`, `format: "raw"` |
+| Favorites | `Shortcut.list` v1 | `category` (notebook, note, tag, stack) and `id` |
 
-Картинки в HTML: `<img class="syno-notestation-image-object" src="webman/3rdparty/NoteStation/images/transparent.gif" ref="…">`. `ref` указывает на `attachment[file_id].ref`. Редактор подменяет `src` на URL скачивания, а при сохранении возвращает исходный.
+Markup details:
 
-## Синхронизация
+- Images: `<img class="syno-notestation-image-object" src="webman/3rdparty/NoteStation/images/transparent.gif" ref="…">`, where `ref` matches `attachment[file_id].ref`. A new `ref` is `base64(timestamp + filename)`. Size is stored in `width`/`height` attributes.
+- Checkboxes: `<input type="image" class="syno-notestation-editor-checkbox">`, plus `syno-notestation-editor-checkbox-checked` when checked.
+- Error 1033 (`drive_get_failed`) means Note Station itself cannot read the note from its storage.
 
-- Локальные правки помечаются `isDirty`, через 3 с после правки, раз в минуту и при возврате в приложение идёт синхронизация.
-- Конфликт (1064): серверная версия остаётся в заметке, локальная сохраняется отдельной заметкой «… (конфликт дата)». Ничего не теряется.
-- Сессия истекла: тихий перелогин паролем из Keychain; 2FA не спрашивается повторно благодаря device token.
+## License
 
-## Не сделано / ограничения
-
-- Зашифрованные заметки только помечаются замком (расшифровка — CryptoJS AES, можно добавить).
-- Добавление картинок и файлов из приложения (нужен multipart в `Note.set`).
-- Редактирование тегов, корзина, офлайн-кэш картинок.
-- Перед App Store: заменить `NSAllowsArbitraryLoads` на `NSAllowsLocalNetworking`, убрать «Synology/Note Station» из названия.
+[MIT](LICENSE)
