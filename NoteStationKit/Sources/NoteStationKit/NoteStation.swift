@@ -163,13 +163,14 @@ public actor NoteStation {
         }
     }
 
-    /// Новая картинка для заметки. `ref` — тот же, что в `<img ref="…">` в HTML.
+    /// Новое вложение. `ref` — тот же, что в `<img ref="…">` в HTML;
+    /// nil — обычный файл, прикреплённый к заметке (в тексте не показывается).
     public struct NewAttachment: Sendable {
-        public var ref: String
+        public var ref: String?
         public var filename: String
         public var mimeType: String
         public var data: Data
-        public init(ref: String, filename: String, mimeType: String, data: Data) {
+        public init(ref: String?, filename: String, mimeType: String, data: Data) {
             self.ref = ref; self.filename = filename; self.mimeType = mimeType; self.data = data
         }
     }
@@ -201,12 +202,27 @@ public actor NoteStation {
         for (n, a) in attachments.enumerated() {
             let field = "nd_file_\(n)"
             files.append(.init(field: field, filename: a.filename, mimeType: a.mimeType, data: a.data))
-            meta.append(["action": "create", "format": "raw", "name": .string(field),
-                         "ref": .string(a.ref), "rotate": true])
+            var m: [String: JSONValue] = ["action": "create", "format": "raw", "name": .string(field), "rotate": true]
+            if let ref = a.ref { m["ref"] = .string(ref) }
+            meta.append(.object(m))
         }
         p["attachment"] = .array(meta)
         let data = try await dsm.upload("SYNO.NoteStation.Note", "set", version: 3, p, files: files)
         return try writeResult(data, fallbackID: id)
+    }
+
+    /// Прикрепить файлы к заметке, не трогая её текст (как «Загрузить файл» в Note Station).
+    public func attachFiles(noteID: String, _ files: [NewAttachment]) async throws -> NSWriteResult {
+        try await updateNote(id: noteID, ver: nil, Changes(), attachments: files, checkConflict: false)
+    }
+
+    /// Удалить вложение заметки.
+    public func deleteAttachment(noteID: String, fileID: String) async throws {
+        _ = try await dsm.call("SYNO.NoteStation.Note", "set", version: 3, [
+            "object_id": .string(noteID),
+            "attachment": [["action": "delete", "file_id": .string(fileID)]],
+            "commit_msg": ["device": .string(device)],
+        ])
     }
 
     /// Переместить в корзину (как кнопка «Удалить» в Note Station).

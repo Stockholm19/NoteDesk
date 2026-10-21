@@ -159,6 +159,26 @@ do {
             print("download: \(back.count) байт, совпадает=\(back == data)")
         }
 
+    case "filetest":
+        // nsctl filetest <note_id> <file> — прикрепить файл, скачать обратно, удалить вложение
+        guard args.count >= 2 else { fail("nsctl filetest <note_id> <file>") }
+        let (_, ns) = client()
+        let file = URL(fileURLWithPath: args[1])
+        let data = try Data(contentsOf: file)
+        let before = try await ns.note(id: args[0])
+        _ = try await ns.attachFiles(noteID: before.id, [.init(ref: nil, filename: file.lastPathComponent,
+                                                                mimeType: "application/octet-stream", data: data)])
+        let after = try await ns.note(id: before.id)
+        guard let att = after.attachments.first(where: { a in !before.attachments.contains { $0.id == a.id } }) else {
+            fail("вложение не появилось")
+        }
+        print("attached: \(att.id) \(att.name ?? "?") \(att.type ?? "?") \(att.size ?? 0)b ref=\(att.ref ?? "нет") content unchanged=\(after.content == before.content)")
+        let back = try await ns.attachmentData(noteID: after.id, fileID: att.id)
+        print("download: \(back.count) байт, совпадает=\(back == data)")
+        try await ns.deleteAttachment(noteID: after.id, fileID: att.id)
+        let final = try await ns.note(id: after.id)
+        print("deleted: \(!final.attachments.contains { $0.id == att.id }), attachments=\(final.attachments.count)")
+
     case "selftest":
         // Проверка записи в отдельном блокноте: создать → изменить → конфликт → в корзину.
         let (_, ns) = client()

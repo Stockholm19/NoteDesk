@@ -708,6 +708,39 @@ final class SyncEngine {
         try? await authed { try await $0.attachmentURL(noteID: noteID, fileID: fileID) }
     }
 
+    /// Прикрепить файлы к заметке. Сначала отправляем правки текста: иначе после
+    /// загрузки у заметки сменится версия и следующая отправка даст ложный конфликт.
+    func attachFiles(to note: LocalNote, _ files: [(name: String, mime: String, data: Data)]) async throws {
+        await syncAndWait()
+        guard let id = note.remoteID else { throw DSMError.malformedResponse }
+        let uploads = files.map { NoteStation.NewAttachment(ref: nil, filename: $0.name, mimeType: $0.mime, data: $0.data) }
+        _ = try await authed { try await $0.attachFiles(noteID: id, uploads) }
+        try await refreshVersion(note, id: id)
+    }
+
+    func deleteAttachment(of note: LocalNote, fileID: String) async throws {
+        await syncAndWait()
+        guard let id = note.remoteID else { return }
+        try await authed { try await $0.deleteAttachment(noteID: id, fileID: fileID) }
+        try await refreshVersion(note, id: id)
+    }
+
+    /// Дождаться, пока все локальные правки уйдут на сервер.
+    private func syncAndWait() async {
+        while isSyncing { try? await Task.sleep(for: .milliseconds(200)) }
+        await sync()
+        while isSyncing { try? await Task.sleep(for: .milliseconds(200)) }
+    }
+
+    /// Текст не менялся — берём только новую версию с сервера.
+    private func refreshVersion(_ note: LocalNote, id: String) async throws {
+        let remote = try await authed { try await $0.note(id: id) }
+        note.remoteVer = Self.version(remote)
+        if let m = remote.mtime { note.mtime = m }
+        note.thumbMD5 = remote.thumbMD5
+        try? context.save()
+    }
+
     /// Файл картинки или вложения — для копирования и сохранения.
     /// ref — картинка из текста; fileID — вложение по id.
     func fileData(note: LocalNote, ref: String?, fileID: String?) async -> Data? {

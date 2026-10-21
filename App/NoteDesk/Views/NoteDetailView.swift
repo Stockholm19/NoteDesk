@@ -2,6 +2,7 @@ import SwiftUI
 import SwiftData
 import NoteStationKit
 import UniformTypeIdentifiers
+import QuickLook
 #if os(macOS)
 import AppKit
 #else
@@ -35,6 +36,11 @@ struct NoteEditorView: View {
     @State private var loadError: String?
     @State private var attachments: [NSAttachment] = []
     @State private var files: [EditorFile] = []
+    @State private var importing = false
+    @State private var uploading = false
+    @State private var fileError: String?
+    @State private var previewURL: URL?
+    @State private var deletingFile: String?
     @AppStorage("editorFontSize") private var fontSize = 16
     @AppStorage("spellcheck") private var spellcheck = true
     @FocusState private var titleFocused: Bool
@@ -46,6 +52,22 @@ struct NoteEditorView: View {
             content
         }
         .toolbar { formattingToolbar }
+        .focusedSceneValue(\.editorController, controller)
+        .fileImporter(isPresented: $importing, allowedContentTypes: [.item], allowsMultipleSelection: true) { result in
+            if case .success(let urls) = result { Task { await attach(urls) } }
+        }
+        .quickLookPreview($previewURL)
+        .alert("Не получилось", isPresented: Binding(get: { fileError != nil }, set: { if !$0 { fileError = nil } })) {
+            Button("OK") { fileError = nil }
+        } message: { Text(fileError ?? "") }
+        .confirmationDialog("Удалить вложение «\(attachments.first { $0.id == deletingFile }?.name ?? "файл")»?",
+                            isPresented: Binding(get: { deletingFile != nil }, set: { if !$0 { deletingFile = nil } }),
+                            titleVisibility: .visible) {
+            Button("Удалить", role: .destructive) {
+                if let id = deletingFile { Task { await removeFile(id) } }
+                deletingFile = nil
+            }
+        }
         .onAppear {
             title = note.title
             if note.remoteID == nil && note.title.isEmpty { titleFocused = true }
@@ -152,6 +174,9 @@ struct NoteEditorView: View {
             fmt("Список", "list.bullet", "insertUnorderedList")
             fmt("Нумерованный список", "list.number", "insertOrderedList")
             Button("Чекбокс", systemImage: "checkmark.square") { controller.exec("checkbox") }
+            Button("Прикрепить файл", systemImage: uploading ? "arrow.up.circle" : "paperclip") { importing = true }
+                .disabled(uploading || note.isEncrypted)
+                .help(uploading ? "Загружаю файлы…" : "Прикрепить файл")
         }
     }
 
@@ -165,20 +190,21 @@ struct NoteEditorView: View {
     private func loadAttachments() async {
         guard note.remoteID != nil else { return }
         let all = await engine.attachments(for: note)
-        guard !all.isEmpty else { return }
         attachments = all
         let html = note.html ?? ""
         var out: [EditorFile] = []
         for a in all where !(a.ref.map { html.contains($0) } ?? false) {
             let ext = ((a.name ?? "") as NSString).pathExtension.lowercased()
             let mime = ["mp4": "video/mp4", "m4v": "video/mp4", "mov": "video/quicktime", "webm": "video/webm"][ext]
-            // Короткие ролики (Telegram-«гифки») показываем прямо в заметке, большие — файлом
+            // Короткие ролики (Telegram-«гифки») крутятся прямо в заметке, как GIF;
+            // длинные — плашкой, по клику открываются в просмотре со звуком
             var data: Data?
-            if mime != nil, (a.size ?? 0) < 40_000_000 {
+            if mime != nil, let size = a.size, size < 8_000_000 {
                 data = await engine.fileData(note: note, ref: nil, fileID: a.id)
             }
             out.append(EditorFile(id: a.id, name: a.name ?? "Файл", video: data != nil,
-                                  data: data?.base64EncodedString(), mime: mime))
+                                  data: data?.base64EncodedString(), mime: mime,
+                                  size: a.size.map { ByteCountFormatter.string(fromByteCount: Int64($0), countStyle: .file) }))
         }
         files = out
     }
@@ -190,12 +216,48 @@ struct NoteEditorView: View {
     }
 
     private func fileAction(_ action: EditorFileAction, ref: String?, fileID: String?) async {
-        guard let data = await engine.fileData(note: note, ref: ref, fileID: fileID) else { return }
+        if action == .delete { deletingFile = fileID; return }
+        guard let data = await engine.fileData(note: note, ref: ref, fileID: fileID) else {
+            fileError = "Не удалось скачать файл с NAS."
+            return
+        }
         let name = fileName(ref: ref, fileID: fileID, data: data)
         switch action {
         case .copy: FileKind.copy(data, name: name)
         case .save: FileKind.save(data, name: name)
         case .open: FileKind.open(data, name: name)
+        case .preview: previewURL = FileKind.tempFile(data, name: name)
+        case .delete: break
+        }
+    }
+
+    /// Файлы с диска — в заметку отдельными вложениями, как «Загрузить файл» в Note Station.
+    private func attach(_ urls: [URL]) async {
+        var files: [(name: String, mime: String, data: Data)] = []
+        for url in urls {
+            let scoped = url.startAccessingSecurityScopedResource()
+            defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+            guard let data = try? Data(contentsOf: url) else { fileError = "Не удалось прочитать «\(url.lastPathComponent)»."; return }
+            let mime = UTType(filenameExtension: url.pathExtension)?.preferredMIMEType ?? "application/octet-stream"
+            files.append((url.lastPathComponent, mime, data))
+        }
+        guard !files.isEmpty else { return }
+        uploading = true
+        defer { uploading = false }
+        do {
+            try await engine.attachFiles(to: note, files)
+            await loadAttachments()
+        } catch {
+            fileError = error.localizedDescription
+        }
+    }
+
+    private func removeFile(_ id: String) async {
+        do {
+            try await engine.deleteAttachment(of: note, fileID: id)
+            await loadAttachments()
+        } catch {
+            fileError = error.localizedDescription
         }
     }
 
@@ -266,7 +328,7 @@ enum FileKind {
         #endif
     }
 
-    private static func tempFile(_ data: Data, name: String) -> URL {
+    static func tempFile(_ data: Data, name: String) -> URL {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("NoteDesk", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let url = dir.appendingPathComponent(name.replacingOccurrences(of: "/", with: "_"))

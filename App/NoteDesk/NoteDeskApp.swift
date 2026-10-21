@@ -34,6 +34,9 @@ struct NoteDeskApp: App {
         .defaultSize(width: 1100, height: 720)
         #endif
         .commands {
+            #if os(macOS)
+            EditCommands()
+            #endif
             CommandGroup(after: .newItem) {
                 Button("Синхронизировать") { Task { await engine.sync() } }
                     .keyboardShortcut("r", modifiers: .command)
@@ -82,3 +85,27 @@ struct RootView: View {
         }
     }
 }
+
+#if os(macOS)
+/// «Отменить» и «Повторить» в меню «Правка». У редактора своя история правок
+/// (чекбоксы и картинки не попадают в штатную историю WebKit), поэтому, когда фокус
+/// в заметке, команда идёт в редактор, иначе — как обычно (поле заголовка и т. п.).
+struct EditCommands: Commands {
+    @FocusedValue(\.editorController) private var editor
+
+    var body: some Commands {
+        CommandGroup(replacing: .undoRedo) {
+            Button("Отменить") {
+                if let editor, editor.hasFocus { editor.undo() }
+                else { NSApp.sendAction(Selector(("undo:")), to: nil, from: nil) }
+            }
+            .keyboardShortcut("z", modifiers: .command)
+            Button("Повторить") {
+                if let editor, editor.hasFocus { editor.redo() }
+                else { NSApp.sendAction(Selector(("redo:")), to: nil, from: nil) }
+            }
+            .keyboardShortcut("z", modifiers: [.command, .shift])
+        }
+    }
+}
+#endif

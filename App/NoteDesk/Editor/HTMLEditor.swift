@@ -15,6 +15,20 @@ final class EditorController {
         webView?.evaluateJavaScript("nd.exec('\(command)', \(v))")
     }
 
+    /// Отмена и повтор — своя история редактора (см. EditorPage).
+    func undo() { webView?.evaluateJavaScript("nd.undo()") }
+    func redo() { webView?.evaluateJavaScript("nd.redo()") }
+
+    /// Фокус ввода сейчас в редакторе (а не, например, в поле заголовка).
+    var hasFocus: Bool {
+        #if os(macOS)
+        guard let webView, let r = webView.window?.firstResponder as? NSView else { return false }
+        return r === webView || r.isDescendant(of: webView)
+        #else
+        return webView?.isFirstResponder ?? false
+        #endif
+    }
+
     /// Текущий HTML без ожидания debounce — перед уходом со страницы.
     func flush() async -> String? {
         guard let webView else { return nil }
@@ -30,10 +44,12 @@ struct EditorFile: Encodable, Equatable {
     /// Видео целиком (base64): по прямой ссылке на NAS WebKit показывал чёрный кадр.
     var data: String?
     var mime: String?
+    /// «1,2 МБ» — для плашки файла
+    var size: String?
 }
 
 /// Что сделать с картинкой или вложением из контекстного меню.
-enum EditorFileAction { case copy, save, open }
+enum EditorFileAction { case copy, save, open, preview, delete }
 
 /// Настройки отображения из окна «Настройки».
 struct EditorPrefs: Equatable {
@@ -171,7 +187,7 @@ struct HTMLEditor {
                 showMenu(ref: b["ref"] as? String, fileID: b["file"] as? String,
                          x: (b["x"] as? Double) ?? 0, y: (b["y"] as? Double) ?? 0)
             case "openFile":
-                if let id = body["body"] as? String { onFileAction(.open, nil, id) }
+                if let id = body["body"] as? String { onFileAction(.preview, nil, id) }
             case "fetchImage":
                 if let s = body["body"] as? String, let url = URL(string: s) { Task { await insertRemoteImage(url) } }
             default: break
@@ -191,9 +207,20 @@ struct HTMLEditor {
                 it.representedObject = MenuPayload(action: action, ref: ref, fileID: fileID)
                 menu.addItem(it)
             }
-            item(isImage ? "Скопировать изображение" : "Скопировать файл", "doc.on.doc", .copy)
-            item("Сохранить как…", "square.and.arrow.down", .save)
-            item("Открыть", "arrow.up.forward.app", .open)
+            if isImage {
+                item("Скопировать изображение", "doc.on.doc", .copy)
+                item("Сохранить как…", "square.and.arrow.down", .save)
+                menu.addItem(.separator())
+                item("Просмотр", "eye", .preview)
+                item("Открыть в программе", "arrow.up.forward.app", .open)
+            } else {
+                item("Просмотр", "eye", .preview)
+                item("Открыть в программе", "arrow.up.forward.app", .open)
+                item("Сохранить как…", "square.and.arrow.down", .save)
+                item("Скопировать файл", "doc.on.doc", .copy)
+                menu.addItem(.separator())
+                item("Удалить вложение…", "trash", .delete)
+            }
             let p = NSPoint(x: x + 14, y: webView.isFlipped ? y + 6 : webView.bounds.height - y - 6)
             menu.popUp(positioning: nil, at: p, in: webView)
             #endif
@@ -266,3 +293,13 @@ extension HTMLEditor: UIViewRepresentable {
     func updateUIView(_ v: WKWebView, context: Context) { update(context.coordinator) }
 }
 #endif
+
+/// Редактор открытой заметки — для команд меню «Правка → Отменить / Повторить».
+struct EditorControllerKey: FocusedValueKey { typealias Value = EditorController }
+
+extension FocusedValues {
+    var editorController: EditorController? {
+        get { self[EditorControllerKey.self] }
+        set { self[EditorControllerKey.self] = newValue }
+    }
+}

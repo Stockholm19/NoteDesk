@@ -60,6 +60,9 @@ enum EditorPage {
     background: rgba(128,128,128,.12); font-size: 13px; cursor: pointer; max-width: 100%; }
   #nd-files .nd-file span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   #nd-files .nd-file:hover { background: rgba(128,128,128,.2); }
+  #nd-files .nd-file b { font-weight: normal; }
+  #nd-files .nd-file i { font-style: normal; color: #888; white-space: nowrap; }
+  #nd-files video { cursor: pointer; }
 
   /* Рамка и панель размера картинки — вне #ed, в заметку не попадают */
   #nd-imgsel { position: absolute; display: none; pointer-events: none;
@@ -183,6 +186,87 @@ enum EditorPage {
   }).observe(ed, { childList: true, subtree: true, characterData: true, attributes: true });
   ed.addEventListener('input', changed);
 
+  // ---- Отмена и повтор (⌘Z / ⇧⌘Z) ----
+  // Чекбоксы, картинки и размер меняются прямо в DOM и в штатную историю WebKit
+  // не попадают — поэтому история своя: снимок содержимого и курсора перед каждой правкой.
+  const hist = { undo: [], redo: [], kind: '', at: 0 };
+
+  function nodePath(node) {
+    const path = [];
+    while (node && node !== ed) {
+      const p = node.parentNode;
+      if (!p) return null;
+      path.unshift([...p.childNodes].indexOf(node));
+      node = p;
+    }
+    return node === ed ? path : null;
+  }
+  function nodeAt(path) {
+    let n = ed;
+    for (const i of path || []) { n = n && n.childNodes[i]; }
+    return n || null;
+  }
+  function saveSel() {
+    const s = window.getSelection();
+    if (!s.rangeCount) return null;
+    const r = s.getRangeAt(0);
+    if (!ed.contains(r.startContainer)) return null;
+    return { sp: nodePath(r.startContainer), so: r.startOffset, ep: nodePath(r.endContainer), eo: r.endOffset };
+  }
+  function restoreSel(x) {
+    const s = window.getSelection();
+    const r = document.createRange();
+    try {
+      const a = x && nodeAt(x.sp), b = x && nodeAt(x.ep);
+      if (!a || !b) throw 0;
+      r.setStart(a, x.so); r.setEnd(b, x.eo);
+    } catch (e) { r.selectNodeContents(ed); r.collapse(false); }
+    s.removeAllRanges(); s.addRange(r);
+  }
+  const snap = () => ({ html: ed.innerHTML, sel: saveSel() });
+
+  // Запомнить состояние ПЕРЕД правкой. Набор текста и удаление склеиваются
+  // в один шаг, пока идут подряд (пауза больше секунды — новый шаг).
+  function record(kind) {
+    if (suppress) return;
+    const now = Date.now();
+    const grouped = (kind === 'typing' || kind === 'delete') && kind === hist.kind && now - hist.at < 1000;
+    hist.kind = kind; hist.at = now;
+    if (grouped) return;
+    const top = hist.undo[hist.undo.length - 1];
+    const cur = snap();
+    if (top && top.html === cur.html) return;
+    hist.undo.push(cur);
+    if (hist.undo.length > 300) hist.undo.shift();
+    hist.redo = [];
+  }
+  function travel(from, to) {
+    if (!from.length) return;
+    to.push(snap());
+    const x = from.pop();
+    hideSel();
+    ed.innerHTML = x.html;
+    restoreSel(x.sel);
+    hist.kind = '';
+    changed();
+  }
+  const undo = () => travel(hist.undo, hist.redo);
+  const redo = () => travel(hist.redo, hist.undo);
+
+  ed.addEventListener('beforeinput', e => {
+    if (e.inputType === 'historyUndo') { e.preventDefault(); undo(); return; }
+    if (e.inputType === 'historyRedo') { e.preventDefault(); redo(); return; }
+    record(e.inputType === 'insertText' || e.inputType === 'insertCompositionText' ? 'typing'
+         : e.inputType.startsWith('delete') && e.inputType.includes('Backward') ? 'delete'
+         : e.inputType);
+  }, true);
+  document.addEventListener('keydown', e => {
+    if (!(e.metaKey || e.ctrlKey) || e.altKey || e.code !== 'KeyZ' && e.code !== 'KeyY') return;
+    if (document.activeElement !== ed) return;
+    e.preventDefault(); e.stopImmediatePropagation();
+    if (e.code === 'KeyY' || e.shiftKey) redo(); else undo();
+  }, true);
+
   // ---- Строки и чекбоксы ----
 
   const BLOCK = /^(P|DIV|LI|H[1-6]|BLOCKQUOTE|PRE)$/;
@@ -229,6 +313,7 @@ enum EditorPage {
   }
 
   function toggleCheckboxLine() {
+    record('checkbox');
     let block = currentBlock();
     if (!block) { document.execCommand('formatBlock', false, 'p'); block = currentBlock(); }
     if (!block) return;
@@ -265,6 +350,7 @@ enum EditorPage {
 
   // Абзац сразу после блока (создаём, если его нет) и курсор в него
   function paragraphAfter(el) {
+    record('paragraph');
     let p = el.nextElementSibling;
     if (!p || p.tagName !== 'P') {
       p = document.createElement('p');
@@ -289,6 +375,7 @@ enum EditorPage {
       paragraphAfter(pre);
     } else if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault(); e.stopImmediatePropagation();
+      record('linebreak');
       document.execCommand('insertLineBreak');
       changed();
     } else if (e.key === 'ArrowDown' && !pre.nextElementSibling && caretAtEnd(pre)) {
@@ -312,6 +399,7 @@ enum EditorPage {
     const block = currentBlock();
     const box = block && leadingCheckbox(block);
     if (!box) return;
+    record('enter');
     if (!block.textContent.replace(/[\s ​]/g, '')) {
       // Enter на пустом пункте — выходим из списка задач: строка становится обычной
       e.preventDefault();
@@ -341,6 +429,7 @@ enum EditorPage {
     const t = e.target;
     if (t.tagName === 'INPUT' && t.classList.contains(CB)) {
       e.preventDefault();
+      record('check');
       t.classList.toggle(CB_ON);
       changed();
     }
@@ -380,6 +469,7 @@ enum EditorPage {
   }
 
   async function insertImages(files) {
+    record('image');
     for (const f of files) {
       const dataURL = await readAsDataURL(f);
       const ext = (f.type.split('/')[1] || 'png').replace('jpeg', 'jpg');
@@ -442,6 +532,7 @@ enum EditorPage {
     doc.querySelectorAll('*').forEach(n => {
       [...n.attributes].forEach(a => { if (a.name.startsWith('on')) n.removeAttribute(a.name); });
     });
+    record('paste');
     document.execCommand('insertHTML', false, doc.body.innerHTML);
   });
 
@@ -489,6 +580,7 @@ enum EditorPage {
       ed.innerHTML = html || '';
       prepare(ed);
       baseline = serialize();
+      hist.undo = []; hist.redo = []; hist.kind = '';
       setTimeout(() => { suppress = false; }, 0);
     },
     setImages(imgs) {
@@ -497,6 +589,8 @@ enum EditorPage {
       prepare(ed);
       setTimeout(() => { suppress = false; }, 0);
     },
+    undo() { if (hist.undo.length) undo(); },
+    redo() { if (hist.redo.length) redo(); },
     setEditable(on) { ed.setAttribute('contenteditable', on ? 'true' : 'false'); },
     setPrefs(size, spell) {
       document.documentElement.style.setProperty('--nd-size', size + 'px');
@@ -512,15 +606,19 @@ enum EditorPage {
           Object.assign(v, { src: URL.createObjectURL(new Blob([bytes], { type: f.mime || 'video/mp4' })),
                              autoplay: true, loop: true, muted: true, playsInline: true, controls: false });
           v.setAttribute('data-file', f.id);
-          v.title = f.name;
+          v.title = f.name + ' — нажмите, чтобы смотреть со звуком';
+          v.addEventListener('click', () => post('openFile', f.id));
           v.addEventListener('error', () => post('log', 'video ' + f.name + ': error ' + (v.error && v.error.code)));
           filesBox.appendChild(v);
         } else {
           const d = document.createElement('div');
           d.className = 'nd-file';
           d.setAttribute('data-file', f.id);
-          d.innerHTML = '📎 <span></span>';
+          d.innerHTML = '<b></b><span></span><i></i>';
+          d.querySelector('b').textContent = f.mime && f.mime.startsWith('video/') ? '▶︎' : '📎';
           d.querySelector('span').textContent = f.name;
+          d.querySelector('i').textContent = f.size || '';
+          d.title = 'Нажмите, чтобы открыть; правая кнопка — сохранить, удалить';
           filesBox.appendChild(d);
         }
       });
@@ -533,6 +631,7 @@ enum EditorPage {
     },
     exec(cmd, value) {
       ed.focus();
+      if (cmd !== 'focus' && cmd !== 'checkbox') record('format');
       if (cmd === 'heading') document.execCommand('formatBlock', false, value);
       else if (cmd === 'checkbox') toggleCheckboxLine();
       else if (cmd !== 'focus') document.execCommand(cmd, false, value || null);
@@ -607,6 +706,7 @@ enum EditorPage {
       const startX = e.clientX, startY = e.clientY;
       const r = selImg.getBoundingClientRect();
       const startW = r.width, ratio = r.width / (r.height || 1);
+      record('resize');
       dragging = true;
       document.body.classList.add('nd-resizing');
       const move = ev => {
@@ -633,6 +733,7 @@ enum EditorPage {
   bar.addEventListener('click', e => {
     const b = e.target.closest('button');
     if (!b || !selImg) return;
+    record('resize');
     const n = naturalSize(selImg);
     const w = currentWidth(selImg);
     switch (b.dataset.a) {
