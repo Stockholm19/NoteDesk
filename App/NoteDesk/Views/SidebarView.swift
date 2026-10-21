@@ -318,24 +318,36 @@ struct SyncStatusLine: View {
     @Environment(SyncEngine.self) private var engine
 
     var body: some View {
-        Group {
-            if let p = engine.contentProgress, p.total > 0 {
-                VStack(alignment: .leading, spacing: 4) {
-                    ProgressView(value: Double(p.done), total: Double(p.total))
-                    Text("Загружено \(p.done) из \(p.total)")
-                }
-            } else if case .error(let m) = engine.phase {
-                Label(m, systemImage: "exclamationmark.triangle")
-                    .foregroundStyle(.orange)
-                    .lineLimit(3)
-            } else if let d = engine.lastSync {
-                Text("Синхронизировано \(d.formatted(date: .omitted, time: .shortened))")
+        // Своя подложка и разделитель: раньше текст висел прямо поверх
+        // прокручиваемого списка и сливался с названиями блокнотов.
+        VStack(spacing: 0) {
+            Divider()
+            content
+                .font(.caption)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 7)
+        }
+        .background(.bar)
+    }
+
+    @ViewBuilder private var content: some View {
+        if let p = engine.contentProgress, p.total > 0 {
+            VStack(alignment: .leading, spacing: 4) {
+                ProgressView(value: Double(p.done), total: Double(p.total))
+                Text("Загружено \(p.done) из \(p.total)")
                     .foregroundStyle(.secondary)
             }
+        } else if case .error(let m) = engine.phase {
+            Label(m, systemImage: "exclamationmark.icloud")
+                .foregroundStyle(.orange)
+                .lineLimit(3)
+        } else if engine.phase == .syncing {
+            Label("Синхронизация…", systemImage: "arrow.triangle.2.circlepath")
+                .foregroundStyle(.secondary)
+        } else if let d = engine.lastSync {
+            Label("Синхронизировано в \(d.formatted(date: .omitted, time: .shortened))", systemImage: "checkmark.icloud")
+                .foregroundStyle(.secondary)
         }
-        .font(.caption)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
     }
 }
