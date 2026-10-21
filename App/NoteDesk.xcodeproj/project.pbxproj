@@ -8,6 +8,7 @@
 
 /* Begin PBXBuildFile section */
 		A1000000000000000000B001 /* NoteStationKit in Frameworks */ = {isa = PBXBuildFile; productRef = A1000000000000000000D001 /* NoteStationKit */; };
+		A2000000000000000000B001 = {isa = PBXBuildFile; productRef = A2000000000000000000D001; platformFilter = macos; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -29,6 +30,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				A1000000000000000000B001 /* NoteStationKit in Frameworks */,
+				A2000000000000000000B001,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -81,6 +83,7 @@
 			name = NoteDesk;
 			packageProductDependencies = (
 				A1000000000000000000D001 /* NoteStationKit */,
+				A2000000000000000000D001,
 			);
 			productName = NoteDesk;
 			productReference = A1000000000000000000F001 /* NoteDesk.app */;
@@ -113,6 +116,7 @@
 			minimizedProjectReferenceProxies = 1;
 			packageReferences = (
 				A10000000000000000004001 /* XCLocalSwiftPackageReference "../NoteStationKit" */,
+				A20000000000000000004001,
 			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = A10000000000000000006002 /* Products */;
@@ -194,8 +198,9 @@
 				ENABLE_APP_SANDBOX = YES;
 				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_OUTGOING_NETWORK_CONNECTIONS = YES;
-				ENABLE_USER_SELECTED_FILES = readwrite;
+				"ENABLE_INCOMING_NETWORK_CONNECTIONS[sdk=macosx*]" = YES;
 				ENABLE_PREVIEWS = YES;
+				ENABLE_USER_SELECTED_FILES = readwrite;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = Config/Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = NoteDesk;
@@ -238,8 +243,9 @@
 				ENABLE_APP_SANDBOX = YES;
 				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_OUTGOING_NETWORK_CONNECTIONS = YES;
-				ENABLE_USER_SELECTED_FILES = readwrite;
+				"ENABLE_INCOMING_NETWORK_CONNECTIONS[sdk=macosx*]" = YES;
 				ENABLE_PREVIEWS = YES;
+				ENABLE_USER_SELECTED_FILES = readwrite;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = Config/Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = NoteDesk;
@@ -300,6 +306,7 @@
 			isa = XCLocalSwiftPackageReference;
 			relativePath = ../NoteStationKit;
 		};
+		A20000000000000000004001 = {isa = XCLocalSwiftPackageReference; relativePath = ../NoteDeskMCP; };
 /* End XCLocalSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
@@ -307,6 +314,7 @@
 			isa = XCSwiftPackageProductDependency;
 			productName = NoteStationKit;
 		};
+		A2000000000000000000D001 = {isa = XCSwiftPackageProductDependency; productName = NoteDeskMCP; };
 /* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = A10000000000000000003001 /* Project object */;

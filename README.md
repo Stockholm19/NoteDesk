@@ -140,3 +140,76 @@ Markup details:
 ## License
 
 [MIT](LICENSE)
+
+## Local MCP (macOS only, read-only)
+
+NoteDesk can serve its **local cache** to an MCP client while the app is running. No AI provider is built in. Enabling MCP does not upload anything by itself, but your chosen client may send returned notes to its AI provider. Only grant access to notebooks you intend to share.
+
+1. Log in to NoteDesk and let its normal sync populate the local cache.
+2. Open Settings → **MCP - доступ только для чтения** and explicitly select notebooks. The default selection is **empty (deny all notes)**.
+3. Enable **Включить локальный MCP**. Status must say it is running. The setting persists and the server starts on subsequent app launches while logged in.
+4. Endpoint: `http://127.0.0.1:18473/mcp`. This binds **only IPv4 loopback**, never LAN, `0.0.0.0`, or IPv6. A port conflict fails closed; no automatic port change.
+5. Use **Копировать токен** only when needed, or **Конфигурация Claude** to copy a bridge configuration. The token is not displayed. Clipboard content is marked concealed/transient and cleared after 60 seconds if unchanged; clipboard managers may ignore these hints. Pasting a configuration into a client makes a separate plaintext copy of the secret there.
+
+The 256-bit random bearer secret is a **separate Keychain item** (`app.notedesk.mcp`, `bearer-v1`, WhenUnlockedThisDeviceOnly), unrelated to NAS credentials. Every HTTP request is authenticated. Only the exact Host `127.0.0.1:18473` is accepted; Origin must be absent or exactly `http://127.0.0.1:18473`. Browser CORS is not enabled. Do not expose this port through a proxy or tunnel. Local bearer auth is not an OAuth authorization server: clients must support a custom Authorization header (directly or through a bridge).
+
+Disabling closes access immediately, including pending connections, then asynchronously tears down the listener. Changing notebook permissions also revokes in-flight responses and restarts the listener. Logout revokes access **before** awaiting NAS logout, disables MCP, clears notebook grants, and deletes its token. A future login requires explicit re-enabling/reselection. Data already delivered to a client cannot be revoked. A locked/unavailable Keychain on startup fails closed; toggle MCP after unlocking to retry.
+
+### Tools and limits
+
+Exactly four tools are advertised:
+
+| Tool | Arguments | Behavior |
+|---|---|---|
+| `list_notebooks` | `offset`, `limit` | Only allowed local notebooks; stable ID order. |
+| `search_notes` | `query`, `offset`, `limit` | Local **title and brief** search, not full-text body search. Scans a bounded page of allowed metadata rows; follow `next_offset` even when `notes` is empty. |
+| `get_note` | `id`, `offset`, `limit` | Local UUID from search, sanitized **plain text**, no HTML attributes/images/attachment URLs. Text pagination counts Swift characters. |
+| `get_sync_status` | none | Coarse state, last successful sync, local-cache freshness warning and allowed notebook count; no global note counts, server URL, credentials or raw error messages. |
+
+- Notebook grants and encrypted/locally-trashed flags are checked on **every read**, including direct note-ID lookup. Missing, denied, locked and trashed IDs share one unavailable error. No downloads, writes or sync triggers occur through MCP.
+- Metadata pages default to 25 rows, maximum 50. Text pages default to 8,000 characters, maximum 16,000. Offset is bounded to 1,000,000; queries/IDs to 512 UTF-8 bytes.
+- `body_status`: `not_downloaded`, `stale`, `available`, or `too_large`. Bodies above 1 MB are not sanitized/returned. `pending_local_changes` identifies unsynced edits. Local cache is **not a real-time NAS permission/trash view**: a remote change is reflected only after normal sync succeeds.
+- Text conversion is deliberately lossy, not a browser/HTML renderer. Script/style elements and tags are removed, and tokens containing known NAS session/download markers are redacted. It is not a general-purpose secret detector: ordinary sensitive text written inside an allowed note remains readable.
+- 64 KiB request body, 8 KiB application header limit (NIO also bounds parsing), 16 concurrent connections, 120 requests/minute globally, 10-second connection deadline. One HTTP request per TCP connection; response uses Content-Length and Connection: close. Chunked request bodies are decoded by NIO. Maximum serialized application result is 256 KB (outer HTTP response capped at 512 KB). Aggressive local clients can temporarily exhaust the rate budget.
+- Pagination is offset-based, not a snapshot: concurrent edits/sync may shift pages. No SSE stream, sessions, subscriptions, attachments, write tools, AI calls or stdio implementation are included.
+
+### Claude Desktop bridge (manual, not installed by NoteDesk)
+
+For a client that only accepts stdio servers, use the existing third-party [mcp-remote](https://github.com/geelen/mcp-remote). Its README and `src/lib/utils.ts` were inspected for `--transport http-only`, `--header`, `${ENV_VAR}` substitution and loopback HTTP handling. **No bridge package was downloaded or executed during implementation; this is source-verified configuration, not an end-to-end Claude test.** Review/trust the bridge and choose an approved pinned release for production rather than blindly accepting npm updates.
+
+```json
+{
+  "mcpServers": {
+    "notedesk": {
+      "command": "npx",
+      "args": [
+        "-y", "mcp-remote", "http://127.0.0.1:18473/mcp",
+        "--transport", "http-only",
+        "--header", "Authorization:Bearer ${NOTEDESK_MCP_TOKEN}",
+        "--silent"
+      ],
+      "env": { "NOTEDESK_MCP_TOKEN": "PASTE_TOKEN_FROM_NOTEDESK" }
+    }
+  }
+}
+```
+
+The space **after Bearer** is required. `${NOTEDESK_MCP_TOKEN}` is expanded by the bridge, not by a shell. Keeping the real token in `env` instead of `args` avoids putting it directly in the process command line; environment/client configuration is still sensitive. Loopback HTTP needs no `--allow-http`. Do not use `--debug`, share clipboard/configuration dumps, or paste the real token into chat. Running this configuration later requires Node/npm and may download the bridge via npx; the app does not do so or alter Claude/LobeHub settings.
+
+### Implementation and verification
+
+`NoteDeskMCP` is a local Swift package using the official [MCP Swift SDK](https://github.com/modelcontextprotocol/swift-sdk) **0.12.1** and SwiftNIO. The SDK's `StatelessHTTPServerTransport` handles initialize/version negotiation, notifications (202), tools, JSON-RPC errors and JSON responses; GET/DELETE return 405. POST accepts JSON plus SSE as required by Streamable HTTP, though this server only produces JSON. Malformed envelopes are checked before entering the SDK. There is a fresh SDK server per HTTP request to avoid sharing initialization state or colliding request IDs across clients; no Mcp-Session-Id is issued and no cross-request initialization state is enforced. Clients should still perform the normal initialize/initialized handshake. HTTP MCP-protocol-version is validated by the SDK. The tested protocol version is `2025-11-25`; unsupported initialize versions negotiate an SDK-supported version. Newer protocol eras are not claimed.
+
+SDK 0.11.0 was evaluated but failed to compile with the installed Swift 6.4 in NetworkTransport (concurrency diagnostics); 0.12.1 contains the upstream fix. This avoids a custom JSON-RPC stack or a fork. NIO handles sockets/HTTP off MainActor. `MCPController` and the thin `MCPReadService` use the existing main SwiftData context for current local edits with bounded metadata fetches and capped body processing. Schema and SyncEngine push/pull algorithms are unchanged. The macOS-only build setting `ENABLE_INCOMING_NETWORK_CONNECTIONS` enables the sandbox server entitlement. iOS excludes the implementation and MCP/NIO dependencies.
+
+Tests use synthetic data and an **in-memory SwiftData store**, never the real app database/NAS/Keychain:
+
+```sh
+xcrun swift test --package-path NoteDeskMCP
+xcodebuild -project App/NoteDesk.xcodeproj -scheme NoteDesk -derivedDataPath .dd -destination 'platform=macOS' CODE_SIGNING_ALLOWED=NO build
+xcodebuild -project App/NoteDesk.xcodeproj -scheme NoteDesk -derivedDataPath .dd -destination 'generic/platform=iOS Simulator' CODE_SIGNING_ALLOWED=NO build
+```
+
+Tests cover protocol/error responses, real loopback HTTP with synthetic data, bearer/Host/Origin checks, rate limits, argument limits, read policy and actual in-memory SwiftData filtering/missing bodies. Test target symlinks point to the application's actual models/read service, avoiding duplicate test implementations. Signed sandbox execution, real Keychain prompts, GUI clipboard behavior, app restart/logout integration, and Claude bridge interoperability still require manual testing on a disposable account/database. Do **not** launch against a production database to test these changes.
+
+**Existing unrelated risk:** `NoteDeskApp` deletes/recreates the cache if opening its schema fails. This can lose unsynced edits; it predates MCP and was intentionally not changed here. MCP adds no schema changes and does not invoke that app initializer in tests.

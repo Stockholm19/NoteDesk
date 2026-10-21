@@ -36,6 +36,10 @@ final class SyncEngine {
     /// Сколько тел заметок скачано в текущей синхронизации.
     private(set) var contentProgress: (done: Int, total: Int)?
 
+    #if os(macOS)
+    var mcp: MCPController?
+    #endif
+
     private let context: ModelContext
     private var dsm: DSMClient?
     private var api: NoteStation?
@@ -56,6 +60,10 @@ final class SyncEngine {
             phase = .idle
         }
         refreshStats()
+        #if os(macOS)
+        mcp = MCPController(context: context, engine: self)
+        mcp?.reconcile()
+        #endif
     }
 
     func refreshStats() {
@@ -90,6 +98,9 @@ final class SyncEngine {
             dsm = client
             api = NoteStation(dsm: client, device: deviceKind)
             phase = .idle
+            #if os(macOS)
+            mcp?.reconcile()
+            #endif
             await sync()
             return false
         } catch let e as DSMError where e.code == 403 && (otp ?? "").isEmpty {
@@ -98,6 +109,9 @@ final class SyncEngine {
     }
 
     func logout() async {
+        #if os(macOS)
+        mcp?.logout()
+        #endif
         await dsm?.logout()
         Keychain.delete()
         account = nil

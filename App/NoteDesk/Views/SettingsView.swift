@@ -20,6 +20,9 @@ struct SettingsView: View {
                     Text("Не выполнен вход").foregroundStyle(.secondary)
                 }
             }
+            #if os(macOS)
+            MCPSettingsView()
+            #endif
             Section("Редактор") {
                 Picker("Размер шрифта", selection: $fontSize) {
                     ForEach([13, 14, 15, 16, 17, 18, 20, 22], id: \.self) { Text($0 == 16 ? "\($0) (по умолчанию)" : "\($0)").tag($0) }
@@ -47,8 +50,7 @@ struct SettingsView: View {
         .formStyle(.grouped)
         .navigationTitle("Настройки")
         #if os(macOS)
-        .frame(width: 460)
-        .fixedSize(horizontal: false, vertical: true)
+        .frame(width: 560, height: 650)
         #else
         .toolbar {
             ToolbarItem(placement: .confirmationAction) { Button("Готово") { dismiss() } }
