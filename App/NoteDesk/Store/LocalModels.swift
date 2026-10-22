@@ -51,10 +51,13 @@ final class LocalNote {
     var imageRefs: [String: String]
     /// md5 превью-картинки от Note Station; nil — превью нет.
     var thumbMD5: String?
+    /// JSON-список вложений заметки (файлы, видео) для мгновенного показа без сетевых запросов.
+    var attachmentsJSON: String?
 
     init(remoteID: String? = nil, notebookID: String?, title: String, html: String?, brief: String = "",
          tags: [String] = [], remoteVer: String? = nil, ctime: Date = .now, mtime: Date = .now,
-         isEncrypted: Bool = false, isDirty: Bool = false, needsContent: Bool = false) {
+         isEncrypted: Bool = false, isDirty: Bool = false, needsContent: Bool = false,
+         attachmentsJSON: String? = nil) {
         self.localID = UUID()
         self.remoteID = remoteID
         self.notebookID = notebookID
@@ -70,6 +73,7 @@ final class LocalNote {
         self.isTrashedLocally = false
         self.needsContent = needsContent
         self.imageRefs = [:]
+        self.attachmentsJSON = attachmentsJSON
     }
 
     var displayTitle: String { title.isEmpty ? "Без названия" : title }
@@ -81,6 +85,45 @@ final class LocalNote {
             guard let newValue else { body = nil; return }
             if let body { body.html = newValue } else { body = NoteBody(html: newValue) }
         }
+    }
+
+    var cachedAttachments: [LocalAttachmentMeta] {
+        get {
+            guard let attachmentsJSON, let data = attachmentsJSON.data(using: .utf8) else { return [] }
+            return (try? JSONDecoder().decode([LocalAttachmentMeta].self, from: data)) ?? []
+        }
+        set {
+            if let data = try? JSONEncoder().encode(newValue) {
+                attachmentsJSON = String(data: data, encoding: .utf8)
+            } else {
+                attachmentsJSON = nil
+            }
+        }
+    }
+}
+
+/// Метаданные вложения, сохранённые локально.
+struct LocalAttachmentMeta: Codable, Hashable, Identifiable, Sendable {
+    var id: String
+    var ref: String?
+    var name: String?
+    var type: String?
+    var size: Int?
+    var md5: String?
+
+    var isVideo: Bool {
+        let ext = ((name ?? "") as NSString).pathExtension.lowercased()
+        return ["mp4", "m4v", "mov", "webm"].contains(ext) || (type?.lowercased().hasPrefix("video/") ?? false)
+    }
+
+    var mimeType: String {
+        if let type, !type.isEmpty { return type }
+        let ext = ((name ?? "") as NSString).pathExtension.lowercased()
+        return ["mp4": "video/mp4", "m4v": "video/mp4", "mov": "video/quicktime", "webm": "video/webm"][ext] ?? "application/octet-stream"
+    }
+
+    var formattedSize: String? {
+        size.map { ByteCountFormatter.string(fromByteCount: Int64($0), countStyle: .file) }
     }
 }
 

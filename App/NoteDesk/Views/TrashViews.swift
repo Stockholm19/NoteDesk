@@ -127,7 +127,7 @@ struct TrashDetailView: View {
                         ContentUnavailableView("Зашифрованная заметка", systemImage: "lock")
                     } else {
                         HTMLEditor(documentKey: key, html: note.content ?? "", images: images, editable: false,
-                                   baseURL: engine.account?.serverURL, controller: controller) { _ in }
+                                   baseURL: engine.account?.serverURL, controller: controller) { _, _ in }
                     }
                 }
             } else if let error {

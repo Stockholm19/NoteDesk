@@ -487,6 +487,10 @@ final class SyncEngine {
             var refs: [String: String] = [:]
             for a in r.attachments { if let ref = a.ref { refs[ref] = a.id } }
             set(\.imageRefs, refs)
+            let metas = r.attachments.map {
+                LocalAttachmentMeta(id: $0.id, ref: $0.ref, name: $0.name, type: $0.type, size: $0.size, md5: $0.md5)
+            }
+            n.cachedAttachments = metas
         }
     }
 
@@ -521,6 +525,14 @@ final class SyncEngine {
 
     func noteLocalID(remoteID: String) -> UUID? {
         note(remoteID: remoteID)?.localID
+    }
+
+    /// Сохранить HTML по UUID заметки, если он действительно изменился.
+    func saveHTMLIfChanged(noteID: UUID, html: String) {
+        var d = FetchDescriptor<LocalNote>(predicate: #Predicate { $0.localID == noteID })
+        d.fetchLimit = 1
+        guard let n = try? context.fetch(d).first, n.html != html, !n.isDeleted else { return }
+        edit(n, html: html)
     }
 
     private func note(remoteID: String) -> LocalNote? {
@@ -712,10 +724,40 @@ final class SyncEngine {
 
     // MARK: Вложения
 
-    /// Список вложений заметки с сервера (картинки в тексте и прочие файлы).
+    /// Список вложений заметки. Сначала возвращает локальный кеш, затем при необходимости обновляет.
     func attachments(for note: LocalNote) async -> [NSAttachment] {
         guard let id = note.remoteID else { return [] }
-        return (try? await authed { try await $0.note(id: id) })?.attachments ?? []
+        let cached = note.cachedAttachments
+        if !cached.isEmpty {
+            return cached.map {
+                NSAttachment(id: $0.id, ref: $0.ref, name: $0.name, type: $0.type, md5: $0.md5, size: $0.size)
+            }
+        }
+        guard let remote = try? await authed({ try await $0.note(id: id) }) else { return [] }
+        let metas = remote.attachments.map {
+            LocalAttachmentMeta(id: $0.id, ref: $0.ref, name: $0.name, type: $0.type, size: $0.size, md5: $0.md5)
+        }
+        note.cachedAttachments = metas
+        try? context.save()
+        return remote.attachments
+    }
+
+    /// Актуализировать вложения с сервера в фоне.
+    func refreshAttachments(for note: LocalNote) async -> [NSAttachment] {
+        guard let id = note.remoteID else { return [] }
+        guard let remote = try? await authed({ try await $0.note(id: id) }) else {
+            return note.cachedAttachments.map {
+                NSAttachment(id: $0.id, ref: $0.ref, name: $0.name, type: $0.type, md5: $0.md5, size: $0.size)
+            }
+        }
+        let metas = remote.attachments.map {
+            LocalAttachmentMeta(id: $0.id, ref: $0.ref, name: $0.name, type: $0.type, size: $0.size, md5: $0.md5)
+        }
+        if note.cachedAttachments != metas {
+            note.cachedAttachments = metas
+            try? context.save()
+        }
+        return remote.attachments
     }
 
     func attachmentURL(noteID: String, fileID: String) async -> URL? {
@@ -736,6 +778,7 @@ final class SyncEngine {
         await syncAndWait()
         guard let id = note.remoteID else { return }
         try await authed { try await $0.deleteAttachment(noteID: id, fileID: fileID) }
+        AttachmentCache.shared.remove(fileID: fileID, filename: "")
         try await refreshVersion(note, id: id)
     }
 
@@ -752,6 +795,9 @@ final class SyncEngine {
         note.remoteVer = Self.version(remote)
         if let m = remote.mtime { note.mtime = m }
         note.thumbMD5 = remote.thumbMD5
+        note.cachedAttachments = remote.attachments.map {
+            LocalAttachmentMeta(id: $0.id, ref: $0.ref, name: $0.name, type: $0.type, size: $0.size, md5: $0.md5)
+        }
         try? context.save()
     }
 
@@ -759,7 +805,15 @@ final class SyncEngine {
     /// ref — картинка из текста; fileID — вложение по id.
     func fileData(note: LocalNote, ref: String?, fileID: String?) async -> Data? {
         if let ref, let p = pendingAttachments(for: note.localID).first(where: { $0.ref == ref }) { return p.data }
-        guard let noteID = note.remoteID, let fid = fileID ?? ref.flatMap({ note.imageRefs[$0] }) else { return nil }
-        return try? await authed { try await $0.attachmentData(noteID: noteID, fileID: fid) }
+        guard let fid = fileID ?? ref.flatMap({ note.imageRefs[$0] }) else { return nil }
+        let filename = note.cachedAttachments.first(where: { $0.id == fid })?.name ?? ""
+        if let cached = AttachmentCache.shared.cachedData(fileID: fid, filename: filename) {
+            return cached
+        }
+        guard let noteID = note.remoteID else { return nil }
+        guard let data = try? await authed({ try await $0.attachmentData(noteID: noteID, fileID: fid) }) else { return nil }
+        let target = AttachmentCache.shared.targetURL(fileID: fid, filename: filename)
+        try? data.write(to: target, options: .atomic)
+        return data
     }
 }

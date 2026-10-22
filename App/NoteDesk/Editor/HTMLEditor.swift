@@ -41,15 +41,19 @@ struct EditorFile: Encodable, Equatable {
     var id: String
     var name: String
     var video: Bool
-    /// Видео целиком (base64): по прямой ссылке на NAS WebKit показывал чёрный кадр.
+    /// Видео целиком (base64): для мгновенного зацикленного воспроизведения коротких роликов.
     var data: String?
     var mime: String?
     /// «1,2 МБ» — для плашки файла
     var size: String?
+    var isCached: Bool = false
+    var isLoading: Bool = false
+    var progress: Double? = nil
+    var error: String? = nil
 }
 
-/// Что сделать с картинкой или вложением из контекстного меню.
-enum EditorFileAction { case copy, save, open, preview, delete }
+/// Что сделать с картинкой или вложением из контекстного меню или плашки.
+enum EditorFileAction { case copy, save, open, preview, delete, download, cancel, retry }
 
 /// Настройки отображения из окна «Настройки».
 struct EditorPrefs: Equatable {
@@ -72,7 +76,7 @@ struct HTMLEditor {
     var onImage: (String, String, String, Data) -> Void = { _, _, _, _ in }
     /// Действие над картинкой (ref) или вложением (id файла).
     var onFileAction: (EditorFileAction, _ ref: String?, _ fileID: String?) -> Void = { _, _, _ in }
-    var onChange: (String) -> Void
+    var onChange: (UUID, String) -> Void
 
     func makeCoordinator() -> Coordinator { Coordinator(onChange: onChange) }
 
@@ -114,7 +118,7 @@ struct HTMLEditor {
     }
 
     final class Coordinator: NSObject, WKNavigationDelegate, WKScriptMessageHandler {
-        var onChange: (String) -> Void
+        var onChange: (UUID, String) -> Void
         var onImage: (String, String, String, Data) -> Void = { _, _, _, _ in }
         var onFileAction: (EditorFileAction, String?, String?) -> Void = { _, _, _ in }
         weak var webView: WKWebView?
@@ -129,7 +133,7 @@ struct HTMLEditor {
         private var knownImages: [String: String] = [:]
         private var pending: (UUID, String, [String: String], Bool)?
 
-        init(onChange: @escaping (String) -> Void) { self.onChange = onChange }
+        init(onChange: @escaping (UUID, String) -> Void) { self.onChange = onChange }
 
         func apply(key: UUID, html: String, images: [String: String], editable: Bool) {
             guard ready, let webView else { pending = (key, html, images, editable); return }
@@ -138,7 +142,7 @@ struct HTMLEditor {
                 knownHTML = html
                 knownImages = images
                 editorLog.debug("load \(html.count, privacy: .public) chars, \(images.count, privacy: .public) images")
-                webView.evaluateJavaScript("nd.load(\(Self.js(html)), \(Self.js(images)))") { _, error in
+                webView.evaluateJavaScript("nd.load(\(Self.js(html)), \(Self.js(images)), '\(key.uuidString)')") { _, error in
                     if let error { editorLog.error("nd.load failed: \(error.localizedDescription, privacy: .public)") }
                 }
             } else if images != knownImages {
@@ -171,9 +175,16 @@ struct HTMLEditor {
                 if let p = pending { pending = nil; apply(key: p.0, html: p.1, images: p.2, editable: p.3) }
                 if let x = wantedExtras { wantedExtras = nil; applyExtras(prefs: x.0, files: x.1) }
             case "changed":
-                guard let html = body["body"] as? String, html != knownHTML else { return }
-                knownHTML = html
-                onChange(html)
+                if let dict = body["body"] as? [String: Any],
+                   let kStr = dict["key"] as? String,
+                   let k = UUID(uuidString: kStr),
+                   let html = dict["html"] as? String {
+                    if k == loadedKey { knownHTML = html }
+                    onChange(k, html)
+                } else if let html = body["body"] as? String, let k = loadedKey {
+                    knownHTML = html
+                    onChange(k, html)
+                }
             case "image":
                 guard let b = body["body"] as? [String: Any],
                       let ref = b["ref"] as? String, let name = b["name"] as? String,
@@ -187,7 +198,13 @@ struct HTMLEditor {
                 showMenu(ref: b["ref"] as? String, fileID: b["file"] as? String,
                          x: (b["x"] as? Double) ?? 0, y: (b["y"] as? Double) ?? 0)
             case "openFile":
-                if let id = body["body"] as? String { onFileAction(.preview, nil, id) }
+                if let id = body["body"] as? String { onFileAction(.open, nil, id) }
+            case "downloadFile":
+                if let id = body["body"] as? String { onFileAction(.download, nil, id) }
+            case "cancelFile":
+                if let id = body["body"] as? String { onFileAction(.cancel, nil, id) }
+            case "retryFile":
+                if let id = body["body"] as? String { onFileAction(.retry, nil, id) }
             case "fetchImage":
                 if let s = body["body"] as? String, let url = URL(string: s) { Task { await insertRemoteImage(url) } }
             default: break

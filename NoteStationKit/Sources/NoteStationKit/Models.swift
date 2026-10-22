@@ -50,6 +50,17 @@ public struct NSAttachment: Sendable, Hashable, Identifiable {
     public var width: Int?
     public var height: Int?
 
+    public init(id: String, ref: String? = nil, name: String? = nil, type: String? = nil, md5: String? = nil, size: Int? = nil, width: Int? = nil, height: Int? = nil) {
+        self.id = id
+        self.ref = ref
+        self.name = name
+        self.type = type
+        self.md5 = md5
+        self.size = size
+        self.width = width
+        self.height = height
+    }
+
     init(id: String, _ v: JSONValue) {
         self.id = id
         ref = v["ref"]?.string

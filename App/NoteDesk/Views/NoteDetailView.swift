@@ -19,7 +19,6 @@ struct NoteDetailView: View {
     var body: some View {
         if let note = match.first {
             NoteEditorView(note: note)
-                .id(note.localID)
         } else {
             ContentUnavailableView("Заметка удалена", systemImage: "trash")
         }
@@ -41,6 +40,8 @@ struct NoteEditorView: View {
     @State private var fileError: String?
     @State private var previewURL: URL?
     @State private var deletingFile: String?
+    @State private var currentNoteID: UUID?
+    @State private var loadTask: Task<Void, Never>?
     @AppStorage("editorFontSize") private var fontSize = 16
     @AppStorage("spellcheck") private var spellcheck = true
     @FocusState private var titleFocused: Bool
@@ -69,19 +70,42 @@ struct NoteEditorView: View {
             }
         }
         .onAppear {
+            currentNoteID = note.localID
             title = note.title
             if note.remoteID == nil && note.title.isEmpty { titleFocused = true }
+            loadInitialFiles()
+            loadTask = Task {
+                await loadImageURLs()
+                await loadAttachments()
+            }
+        }
+        .onChange(of: note.localID) { oldID, newID in
+            guard oldID != newID else { return }
+            loadTask?.cancel()
+            let prevID = oldID
+            Task {
+                if let html = await controller.flush() {
+                    engine.saveHTMLIfChanged(noteID: prevID, html: html)
+                }
+            }
+            currentNoteID = newID
+            title = note.title
+            previewURL = nil
+            fileError = nil
+            loadError = nil
+            loadInitialFiles()
+            loadTask = Task {
+                await loadImageURLs()
+                await loadAttachments()
+            }
         }
         .onChange(of: note.title) { _, new in
             if !titleFocused { title = new }   // обновилось с сервера
         }
-        .task(id: note.imageRefs) {
-            await loadImageURLs()
-            await loadAttachments()
-        }
         .onDisappear {
+            loadTask?.cancel()
             Task {
-                // flush вернёт nil, если правок не было
+                // flush вернет nil, если правок не было
                 if let html = await controller.flush(), html != note.html, !note.isDeleted {
                     engine.edit(note, html: html)
                 }
@@ -142,9 +166,10 @@ struct NoteEditorView: View {
                        },
                        onFileAction: { action, ref, fileID in
                            Task { await fileAction(action, ref: ref, fileID: fileID) }
-                       }) { newHTML in
-                engine.edit(note, html: newHTML)
-            }
+                       },
+                       onChange: { key, newHTML in
+                           engine.saveHTMLIfChanged(noteID: key, html: newHTML)
+                       })
         } else if let loadError {
             ContentUnavailableView("Не удалось открыть", systemImage: "exclamationmark.triangle",
                                    description: Text(loadError))
@@ -185,49 +210,271 @@ struct NoteEditorView: View {
             .symbolVariant(controller.state[cmd] == true ? .fill : .none)
     }
 
-    /// Вложения вне текста. Так Note Station хранит «гифки» из Telegram:
-    /// статичная картинка в тексте и mp4 отдельным файлом.
-    private func loadAttachments() async {
-        guard note.remoteID != nil else { return }
-        let all = await engine.attachments(for: note)
-        attachments = all
+    /// Проверяет, упоминается ли вложение уже внутри HTML-тела заметки.
+    /// Исключает дублирование плашек для файлов/видео, которые уже есть в тексте.
+    private func isAttachmentInHTML(ref: String?, fileID: String, filename: String?, html: String) -> Bool {
+        if let ref, !ref.isEmpty, html.contains(ref) { return true }
+        if !fileID.isEmpty && html.contains(fileID) { return true }
+        if let filename, !filename.isEmpty, html.contains(filename) { return true }
+        return false
+    }
+
+    /// Мгновенная инициализация файлов из локального кеша (0 мс, не ждем сеть).
+    private func loadInitialFiles() {
         let html = note.html ?? ""
+        var seen = Set<String>()
         var out: [EditorFile] = []
-        for a in all where !(a.ref.map { html.contains($0) } ?? false) {
-            let ext = ((a.name ?? "") as NSString).pathExtension.lowercased()
-            let mime = ["mp4": "video/mp4", "m4v": "video/mp4", "mov": "video/quicktime", "webm": "video/webm"][ext]
-            // Короткие ролики (Telegram-«гифки») крутятся прямо в заметке, как GIF;
-            // длинные — плашкой, по клику открываются в просмотре со звуком
-            var data: Data?
-            if mime != nil, let size = a.size, size < 8_000_000 {
-                data = await engine.fileData(note: note, ref: nil, fileID: a.id)
+        for a in note.cachedAttachments {
+            guard !isAttachmentInHTML(ref: a.ref, fileID: a.id, filename: a.name, html: html) else { continue }
+            guard seen.insert(a.id).inserted else { continue }
+            let name = a.name ?? "Файл"
+            let isCached = AttachmentCache.shared.isCached(fileID: a.id, filename: name)
+            var dataStr: String?
+            if a.isVideo, (a.size ?? 0) < 8_000_000, isCached,
+               let data = AttachmentCache.shared.cachedData(fileID: a.id, filename: name) {
+                dataStr = data.base64EncodedString()
             }
-            out.append(EditorFile(id: a.id, name: a.name ?? "Файл", video: data != nil,
-                                  data: data?.base64EncodedString(), mime: mime,
-                                  size: a.size.map { ByteCountFormatter.string(fromByteCount: Int64($0), countStyle: .file) }))
+            out.append(EditorFile(
+                id: a.id,
+                name: name,
+                video: dataStr != nil,
+                data: dataStr,
+                mime: a.mimeType,
+                size: a.formattedSize,
+                isCached: isCached,
+                isLoading: false,
+                progress: nil,
+                error: nil
+            ))
         }
         files = out
     }
 
-    private func fileName(ref: String?, fileID: String?, data: Data) -> String {
+    /// Вложения вне текста: загрузка актуального списка с сервера и потоковое кеширование.
+    private func loadAttachments() async {
+        guard let remoteID = note.remoteID else { return }
+        let all = await engine.refreshAttachments(for: note)
+        guard !Task.isCancelled else { return }
+        attachments = all
+        let html = note.html ?? ""
+        var seen = Set<String>()
+        var out: [EditorFile] = []
+
+        for a in all {
+            guard !isAttachmentInHTML(ref: a.ref, fileID: a.id, filename: a.name, html: html) else { continue }
+            guard seen.insert(a.id).inserted else { continue }
+            let name = a.name ?? "Файл"
+            let ext = ((a.name ?? "") as NSString).pathExtension.lowercased()
+            let mime = ["mp4": "video/mp4", "m4v": "video/mp4", "mov": "video/quicktime", "webm": "video/webm"][ext]
+                ?? a.type ?? "application/octet-stream"
+            let isVideo = ["mp4", "m4v", "mov", "webm"].contains(ext) || mime.hasPrefix("video/")
+
+            var isCached = AttachmentCache.shared.isCached(fileID: a.id, filename: name)
+            var dataStr: String?
+
+            if isVideo, let size = a.size, size < 8_000_000 {
+                if let data = AttachmentCache.shared.cachedData(fileID: a.id, filename: name) {
+                    dataStr = data.base64EncodedString()
+                    isCached = true
+                }
+            }
+
+            out.append(EditorFile(
+                id: a.id,
+                name: name,
+                video: dataStr != nil,
+                data: dataStr,
+                mime: mime,
+                size: a.size.map { ByteCountFormatter.string(fromByteCount: Int64($0), countStyle: .file) },
+                isCached: isCached,
+                isLoading: false,
+                progress: nil,
+                error: nil
+            ))
+        }
+
+        await MainActor.run {
+            self.files = out
+        }
+
+        // Для коротких видео, которых ещё нет в кеше, запускаем фоновую загрузку в кеш
+        for item in out where item.video == false && item.mime?.hasPrefix("video/") == true {
+            guard let att = all.first(where: { $0.id == item.id }),
+                  let size = att.size, size < 8_000_000,
+                  !AttachmentCache.shared.isCached(fileID: item.id, filename: item.name) else { continue }
+            await autoDownloadShortVideo(fileID: item.id, filename: item.name, remoteNoteID: remoteID)
+        }
+    }
+
+    private func autoDownloadShortVideo(fileID: String, filename: String, remoteNoteID: String) async {
+        guard let remoteURL = await engine.attachmentURL(noteID: remoteNoteID, fileID: fileID) else { return }
+        await MainActor.run {
+            self.updateFileState(id: fileID) { $0.isLoading = true; $0.progress = 0 }
+        }
+        do {
+            _ = try await AttachmentCache.shared.download(fileID: fileID, filename: filename, from: remoteURL) { progress in
+                Task { @MainActor in
+                    self.updateFileState(id: fileID) { $0.progress = progress }
+                }
+            }
+            if let data = AttachmentCache.shared.cachedData(fileID: fileID, filename: filename) {
+                await MainActor.run {
+                    self.updateFileState(id: fileID) {
+                        $0.isLoading = false
+                        $0.isCached = true
+                        $0.video = true
+                        $0.data = data.base64EncodedString()
+                    }
+                }
+            }
+        } catch {
+            if Task.isCancelled || isCancellation(error) {
+                await MainActor.run {
+                    self.updateFileState(id: fileID) {
+                        $0.isLoading = false
+                        $0.progress = nil
+                        $0.error = nil
+                    }
+                }
+                return
+            }
+            await MainActor.run {
+                self.updateFileState(id: fileID) {
+                    $0.isLoading = false
+                    $0.error = "Ошибка"
+                }
+            }
+        }
+    }
+
+    private func updateFileState(id: String, mutate: (inout EditorFile) -> Void) {
+        if let idx = files.firstIndex(where: { $0.id == id }) {
+            var f = files[idx]
+            mutate(&f)
+            files[idx] = f
+        }
+    }
+
+    private func fileName(ref: String?, fileID: String?) -> String {
         let fid = fileID ?? ref.flatMap { note.imageRefs[$0] }
         if let name = attachments.first(where: { $0.id == fid })?.name, !name.isEmpty { return name }
-        return "image." + (FileKind.sniff(data)?.preferredFilenameExtension ?? "png")
+        if let name = note.cachedAttachments.first(where: { $0.id == fid })?.name, !name.isEmpty { return name }
+        return "file"
     }
 
     private func fileAction(_ action: EditorFileAction, ref: String?, fileID: String?) async {
         if action == .delete { deletingFile = fileID; return }
-        guard let data = await engine.fileData(note: note, ref: ref, fileID: fileID) else {
-            fileError = "Не удалось скачать файл с NAS."
+        if action == .cancel, let fileID {
+            AttachmentCache.shared.cancel(fileID: fileID)
+            updateFileState(id: fileID) {
+                $0.isLoading = false
+                $0.progress = nil
+                $0.error = nil
+            }
             return
         }
-        let name = fileName(ref: ref, fileID: fileID, data: data)
+        if action == .retry, let fileID {
+            await downloadAndOpen(fileID: fileID)
+            return
+        }
+        if action == .download, let fileID {
+            await downloadAndOpen(fileID: fileID)
+            return
+        }
+
+        guard let fid = fileID ?? ref.flatMap({ note.imageRefs[$0] }) else { return }
+        let name = fileName(ref: ref, fileID: fid)
+
+        if let cachedURL = AttachmentCache.shared.cachedFileURL(fileID: fid, filename: name) {
+            handleLocalFile(action, url: cachedURL, name: name)
+            return
+        }
+
+        guard let localURL = await downloadAndOpen(fileID: fid) else {
+            return
+        }
+        handleLocalFile(action, url: localURL, name: name)
+    }
+
+    @discardableResult
+    private func downloadAndOpen(fileID: String) async -> URL? {
+        guard let remoteID = note.remoteID else { return nil }
+        let name = fileName(ref: nil, fileID: fileID)
+        guard let downloadURL = await engine.attachmentURL(noteID: remoteID, fileID: fileID) else {
+            fileError = "Не удалось получить ссылку на файл с NAS."
+            return nil
+        }
+        await MainActor.run {
+            self.updateFileState(id: fileID) { $0.isLoading = true; $0.progress = 0; $0.error = nil }
+        }
+        do {
+            let localURL = try await AttachmentCache.shared.download(fileID: fileID, filename: name, from: downloadURL) { progress in
+                Task { @MainActor in
+                    self.updateFileState(id: fileID) { $0.progress = progress }
+                }
+            }
+            await MainActor.run {
+                let ext = ((name as NSString).pathExtension).lowercased()
+                let isVideo = ["mp4", "m4v", "mov", "webm"].contains(ext)
+                var dataStr: String?
+                if isVideo, let data = AttachmentCache.shared.cachedData(fileID: fileID, filename: name), data.count < 8_000_000 {
+                    dataStr = data.base64EncodedString()
+                }
+
+                self.updateFileState(id: fileID) {
+                    $0.isLoading = false
+                    $0.isCached = true
+                    $0.progress = nil
+                    $0.error = nil
+                    if let dataStr {
+                        $0.video = true
+                        $0.data = dataStr
+                    }
+                }
+            }
+            return localURL
+        } catch {
+            if Task.isCancelled || isCancellation(error) {
+                await MainActor.run {
+                    self.updateFileState(id: fileID) {
+                        $0.isLoading = false
+                        $0.progress = nil
+                        $0.error = nil
+                    }
+                }
+                return nil
+            }
+            await MainActor.run {
+                self.updateFileState(id: fileID) {
+                    $0.isLoading = false
+                    $0.error = "Ошибка"
+                }
+                self.fileError = "Не удалось скачать файл: \(error.localizedDescription)"
+            }
+            return nil
+        }
+    }
+
+    private func handleLocalFile(_ action: EditorFileAction, url: URL, name: String) {
         switch action {
-        case .copy: FileKind.copy(data, name: name)
-        case .save: FileKind.save(data, name: name)
-        case .open: FileKind.open(data, name: name)
-        case .preview: previewURL = FileKind.tempFile(data, name: name)
-        case .delete: break
+        case .preview:
+            previewURL = url
+        case .open:
+            #if os(macOS)
+            NSWorkspace.shared.open(url)
+            #else
+            previewURL = url
+            #endif
+        case .copy:
+            if let data = try? Data(contentsOf: url) {
+                FileKind.copy(data, name: name)
+            }
+        case .save:
+            if let data = try? Data(contentsOf: url) {
+                FileKind.save(data, name: name)
+            }
+        default:
+            break
         }
     }
 

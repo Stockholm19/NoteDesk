@@ -62,6 +62,8 @@ enum EditorPage {
   #nd-files .nd-file:hover { background: rgba(128,128,128,.2); }
   #nd-files .nd-file b { font-weight: normal; }
   #nd-files .nd-file i { font-style: normal; color: #888; white-space: nowrap; }
+  #nd-files .nd-file .nd-cancel { margin-left: 4px; opacity: .6; font-size: 11px; padding: 1px 4px; border-radius: 4px; }
+  #nd-files .nd-file .nd-cancel:hover { opacity: 1; background: rgba(128,128,128,.3); }
   #nd-files video { cursor: pointer; }
 
   /* Рамка и панель размера картинки — вне #ed, в заметку не попадают */
@@ -132,6 +134,11 @@ enum EditorPage {
   let images = {};
   let timer = null;
   let suppress = false;
+  let currentDocKey = '';
+
+  function escapeHTML(s) {
+    return (s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  }
 
   function swapSrc(el, url) {
     if (!el.hasAttribute('data-nd-src')) el.setAttribute('data-nd-src', el.getAttribute('src') || '');
@@ -176,7 +183,7 @@ enum EditorPage {
       const h = serialize();
       if (h === baseline) return;
       baseline = h;
-      post('changed', h);
+      post('changed', { key: currentDocKey, html: h });
     }, 400);
   }
 
@@ -559,10 +566,6 @@ enum EditorPage {
   });
 
   const filesBox = document.getElementById('nd-files');
-  filesBox.addEventListener('click', e => {
-    const f = e.target.closest('.nd-file');
-    if (f) post('openFile', f.getAttribute('data-file'));
-  });
 
   document.addEventListener('selectionchange', () => {
     const s = {};
@@ -572,9 +575,15 @@ enum EditorPage {
   });
 
   window.nd = {
-    load(html, imgs) {
-      suppress = true;
+    load(html, imgs, key) {
       clearTimeout(timer);
+      const prev = serialize();
+      if (currentDocKey && prev !== baseline) {
+        baseline = prev;
+        post('changed', { key: currentDocKey, html: prev });
+      }
+      currentDocKey = key || '';
+      suppress = true;
       images = imgs || {};
       hideSel();
       ed.innerHTML = html || '';
@@ -607,18 +616,50 @@ enum EditorPage {
                              autoplay: true, loop: true, muted: true, playsInline: true, controls: false });
           v.setAttribute('data-file', f.id);
           v.title = f.name + ' — нажмите, чтобы смотреть со звуком';
-          v.addEventListener('click', () => post('openFile', f.id));
+          v.addEventListener('click', () => {
+            if (!v.controls) {
+              v.controls = true;
+              v.muted = false;
+              v.play();
+            }
+          });
           v.addEventListener('error', () => post('log', 'video ' + f.name + ': error ' + (v.error && v.error.code)));
           filesBox.appendChild(v);
         } else {
           const d = document.createElement('div');
           d.className = 'nd-file';
           d.setAttribute('data-file', f.id);
-          d.innerHTML = '<b></b><span></span><i></i>';
-          d.querySelector('b').textContent = f.mime && f.mime.startsWith('video/') ? '▶︎' : '📎';
-          d.querySelector('span').textContent = f.name;
-          d.querySelector('i').textContent = f.size || '';
-          d.title = 'Нажмите, чтобы открыть; правая кнопка — сохранить, удалить';
+          const isVid = f.video || (f.mime && f.mime.startsWith('video/'));
+          let icon = isVid ? '▶︎' : '📎';
+          let statusText = f.size || '';
+          if (f.isLoading) {
+            const p = Math.round((f.progress || 0) * 100);
+            icon = '⏳';
+            statusText = p > 0 ? p + '%' : 'Загрузка…';
+          } else if (f.error) {
+            icon = '⚠️';
+            statusText = 'Ошибка (повторить)';
+          } else if (f.isCached) {
+            statusText = (f.size ? f.size + ' • ' : '') + '✓';
+          }
+
+          d.innerHTML = '<b>' + icon + '</b><span>' + escapeHTML(f.name) + '</span><i>' + statusText + '</i>' +
+            (f.isLoading ? '<span class="nd-cancel" title="Отменить загрузку">✕</span>' : '');
+
+          d.title = f.error ? 'Нажмите, чтобы повторить загрузку'
+                  : f.isLoading ? 'Загрузка… нажмите ✕ для отмены'
+                  : (f.isCached ? 'Нажмите, чтобы открыть; правая кнопка — сохранить, удалить' : 'Нажмите, чтобы скачать и открыть');
+
+          d.addEventListener('click', e => {
+            if (e.target.classList.contains('nd-cancel')) {
+              e.stopPropagation();
+              post('cancelFile', f.id);
+              return;
+            }
+            if (f.isLoading) return;
+            if (f.error) { post('retryFile', f.id); return; }
+            post('openFile', f.id);
+          });
           filesBox.appendChild(d);
         }
       });
