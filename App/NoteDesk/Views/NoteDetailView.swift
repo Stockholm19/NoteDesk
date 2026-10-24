@@ -42,6 +42,11 @@ struct NoteEditorView: View {
     @State private var deletingFile: String?
     @State private var currentNoteID: UUID?
     @State private var loadTask: Task<Void, Never>?
+    // Ссылки: окно «Ссылка» и действия по нажатию на iPhone
+    @State private var linkDraft: EditorLink?
+    @State private var linkURL = ""
+    @State private var linkText = ""
+    @State private var tappedLink: EditorLink?
     @AppStorage("editorFontSize") private var fontSize = 16
     @AppStorage("spellcheck") private var spellcheck = true
     @FocusState private var titleFocused: Bool
@@ -58,6 +63,32 @@ struct NoteEditorView: View {
             if case .success(let urls) = result { Task { await attach(urls) } }
         }
         .quickLookPreview($previewURL)
+        .alert(linkDraft?.inLink == true ? "Изменить ссылку" : "Новая ссылка",
+               isPresented: Binding(get: { linkDraft != nil }, set: { if !$0 { linkDraft = nil } })) {
+            TextField("Адрес, например ya.ru", text: $linkURL)
+                #if os(iOS)
+                .keyboardType(.URL)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                #endif
+            TextField("Текст ссылки", text: $linkText)
+            Button("Сохранить") { controller.applyLink(url: linkURL, text: linkText); linkDraft = nil }
+            if linkDraft?.inLink == true {
+                Button("Удалить ссылку", role: .destructive) { controller.removeLink(); linkDraft = nil }
+            }
+            Button("Отмена", role: .cancel) { linkDraft = nil }
+        } message: {
+            Text("Пустой адрес убирает ссылку, текст остаётся.")
+        }
+        .confirmationDialog(tappedLink?.url ?? "", isPresented: Binding(get: { tappedLink != nil }, set: { if !$0 { tappedLink = nil } }),
+                            titleVisibility: .visible) {
+            if let link = tappedLink {
+                Button("Открыть") { EditorLink.open(link.url) }
+                Button("Изменить ссылку…") { editLink(link) }
+                Button("Скопировать ссылку") { copyLink(link.url) }
+                Button("Удалить ссылку", role: .destructive) { controller.removeLink() }
+            }
+        }
         .alert("Не получилось", isPresented: Binding(get: { fileError != nil }, set: { if !$0 { fileError = nil } })) {
             Button("OK") { fileError = nil }
         } message: { Text(fileError ?? "") }
@@ -167,6 +198,12 @@ struct NoteEditorView: View {
                        onFileAction: { action, ref, fileID in
                            Task { await fileAction(action, ref: ref, fileID: fileID) }
                        },
+                       onLink: { event in
+                           switch event {
+                           case .tapped(let link): tappedLink = link
+                           case .edit(let link): editLink(link)
+                           }
+                       },
                        onChange: { key, newHTML in
                            engine.saveHTMLIfChanged(noteID: key, html: newHTML)
                        })
@@ -199,6 +236,11 @@ struct NoteEditorView: View {
             fmt("Список", "list.bullet", "insertUnorderedList")
             fmt("Нумерованный список", "list.number", "insertOrderedList")
             Button("Чекбокс", systemImage: "checkmark.square") { controller.exec("checkbox") }
+            Button("Ссылка", systemImage: "link") {
+                Task { if let link = await controller.beginLink() { editLink(link) } }
+            }
+            .help("Добавить или изменить ссылку (⌘K)")
+            .disabled(note.isEncrypted)
             Button("Прикрепить файл", systemImage: uploading ? "arrow.up.circle" : "paperclip") { importing = true }
                 .disabled(uploading || note.isEncrypted)
                 .help(uploading ? "Загружаю файлы…" : "Прикрепить файл")
@@ -208,6 +250,28 @@ struct NoteEditorView: View {
     private func fmt(_ title: String, _ icon: String, _ cmd: String) -> some View {
         Button(title, systemImage: icon) { controller.exec(cmd) }
             .symbolVariant(controller.state[cmd] == true ? .fill : .none)
+    }
+
+    /// Открыть окно «Ссылка». Для новой ссылки на Mac адрес подставляется из буфера, если там ссылка.
+    private func editLink(_ link: EditorLink) {
+        linkURL = link.url
+        linkText = link.text
+        #if os(macOS)
+        if linkURL.isEmpty, let s = NSPasteboard.general.string(forType: .string)?.trimmingCharacters(in: .whitespacesAndNewlines),
+           s.hasPrefix("http://") || s.hasPrefix("https://"), !s.contains(" ") {
+            linkURL = s
+        }
+        #endif
+        linkDraft = link
+    }
+
+    private func copyLink(_ url: String) {
+        #if os(macOS)
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(url, forType: .string)
+        #else
+        UIPasteboard.general.string = url
+        #endif
     }
 
     /// Проверяет, упоминается ли вложение уже внутри HTML-тела заметки.

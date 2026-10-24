@@ -29,11 +29,56 @@ final class EditorController {
         #endif
     }
 
+    /// Окно «Ссылка»: что сейчас выделено или в какой ссылке курсор.
+    func beginLink() async -> EditorLink? {
+        guard let webView, let d = try? await webView.evaluateJavaScript("nd.beginLink()") as? [String: Any] else { return nil }
+        return EditorLink(d)
+    }
+    func applyLink(url: String, text: String) {
+        webView?.evaluateJavaScript("nd.applyLink(\(jsLiteral(url)), \(jsLiteral(text)))")
+    }
+    func removeLink() { webView?.evaluateJavaScript("nd.removeLink()") }
+
     /// Текущий HTML без ожидания debounce — перед уходом со страницы.
     func flush() async -> String? {
         guard let webView else { return nil }
         return try? await webView.evaluateJavaScript("nd.flush()") as? String
     }
+}
+
+/// Ссылка в тексте заметки.
+struct EditorLink: Equatable {
+    var url: String
+    var text: String
+    /// Курсор или клик внутри существующей ссылки (иначе — новая)
+    var inLink: Bool
+
+    init(url: String = "", text: String = "", inLink: Bool = false) {
+        self.url = url; self.text = text; self.inLink = inLink
+    }
+    init(_ d: [String: Any]) {
+        self.init(url: d["url"] as? String ?? "", text: d["text"] as? String ?? "", inLink: d["inLink"] as? Bool ?? false)
+    }
+
+    /// Открыть в браузере (или почте для mailto:).
+    static func open(_ s: String) {
+        guard let url = URL(string: s) ?? s.addingPercentEncoding(withAllowedCharacters: .urlFragmentAllowed).flatMap(URL.init(string:))
+        else { return }
+        #if os(macOS)
+        NSWorkspace.shared.open(url)
+        #else
+        UIApplication.shared.open(url)
+        #endif
+    }
+}
+
+/// Клик по ссылке (на iPhone — показать действия) или запрос окна «Ссылка».
+enum EditorLinkEvent { case tapped(EditorLink), edit(EditorLink) }
+
+/// Строка как литерал JavaScript (JSON-экранирование).
+private func jsLiteral(_ s: String) -> String {
+    let data = (try? JSONEncoder().encode(s)) ?? Data("\"\"".utf8)
+    return String(decoding: data, as: UTF8.self)
 }
 
 /// Вложение заметки, которого нет в тексте: видео (вместо GIF) или файл.
@@ -76,6 +121,8 @@ struct HTMLEditor {
     var onImage: (String, String, String, Data) -> Void = { _, _, _, _ in }
     /// Действие над картинкой (ref) или вложением (id файла).
     var onFileAction: (EditorFileAction, _ ref: String?, _ fileID: String?) -> Void = { _, _, _ in }
+    /// nil — клик по ссылке просто открывает её (просмотр корзины и т. п.)
+    var onLink: ((EditorLinkEvent) -> Void)? = nil
     var onChange: (UUID, String) -> Void
 
     func makeCoordinator() -> Coordinator { Coordinator(onChange: onChange) }
@@ -111,6 +158,7 @@ struct HTMLEditor {
         c.onChange = onChange
         c.onImage = onImage
         c.onFileAction = onFileAction
+        c.onLink = onLink
         controller.webView = c.webView
         c.controller = controller
         c.apply(key: documentKey, html: html, images: images, editable: editable)
@@ -121,6 +169,7 @@ struct HTMLEditor {
         var onChange: (UUID, String) -> Void
         var onImage: (String, String, String, Data) -> Void = { _, _, _, _ in }
         var onFileAction: (EditorFileAction, String?, String?) -> Void = { _, _, _ in }
+        var onLink: ((EditorLinkEvent) -> Void)?
         weak var webView: WKWebView?
         private var appliedPrefs: EditorPrefs?
         private var appliedFiles: [EditorFile]?
@@ -205,6 +254,20 @@ struct HTMLEditor {
                 if let id = body["body"] as? String { onFileAction(.cancel, nil, id) }
             case "retryFile":
                 if let id = body["body"] as? String { onFileAction(.retry, nil, id) }
+            case "link":
+                guard let b = body["body"] as? [String: Any] else { return }
+                let link = EditorLink(b)
+                #if os(macOS)
+                EditorLink.open(link.url)    // как в Заметках: клик открывает ссылку
+                #else
+                if let onLink { onLink(.tapped(link)) } else { EditorLink.open(link.url) }
+                #endif
+            case "linkMenu":
+                guard let b = body["body"] as? [String: Any] else { return }
+                showLinkMenu(EditorLink(b), x: (b["x"] as? Double) ?? 0, y: (b["y"] as? Double) ?? 0)
+            case "linkEdit":
+                guard let b = body["body"] as? [String: Any] else { return }
+                onLink?(.edit(EditorLink(b)))
             case "fetchImage":
                 if let s = body["body"] as? String, let url = URL(string: s) { Task { await insertRemoteImage(url) } }
             default: break
@@ -240,6 +303,48 @@ struct HTMLEditor {
             }
             let p = NSPoint(x: x + 14, y: webView.isFlipped ? y + 6 : webView.bounds.height - y - 6)
             menu.popUp(positioning: nil, at: p, in: webView)
+            #endif
+        }
+
+        /// Правый клик по ссылке (Mac): открыть, изменить, скопировать, удалить.
+        private func showLinkMenu(_ link: EditorLink, x: Double, y: Double) {
+            #if os(macOS)
+            guard let webView else { return }
+            let menu = NSMenu()
+            func item(_ title: String, _ icon: String, _ kind: String) {
+                let it = NSMenuItem(title: title, action: #selector(linkMenuFired(_:)), keyEquivalent: "")
+                it.target = self
+                it.image = NSImage(systemSymbolName: icon, accessibilityDescription: nil)
+                it.representedObject = LinkPayload(kind: kind, link: link)
+                menu.addItem(it)
+            }
+            item("Открыть ссылку", "safari", "open")
+            item("Изменить ссылку…", "pencil", "edit")
+            item("Скопировать ссылку", "doc.on.doc", "copy")
+            menu.addItem(.separator())
+            item("Удалить ссылку", "xmark.circle", "remove")
+            let p = NSPoint(x: x + 14, y: webView.isFlipped ? y + 6 : webView.bounds.height - y - 6)
+            menu.popUp(positioning: nil, at: p, in: webView)
+            #endif
+        }
+
+        private final class LinkPayload {
+            let kind: String; let link: EditorLink
+            init(kind: String, link: EditorLink) { self.kind = kind; self.link = link }
+        }
+
+        @objc private func linkMenuFired(_ sender: AnyObject) {
+            #if os(macOS)
+            guard let p = (sender as? NSMenuItem)?.representedObject as? LinkPayload else { return }
+            switch p.kind {
+            case "open": EditorLink.open(p.link.url)
+            case "edit": onLink?(.edit(p.link))
+            case "copy":
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(p.link.url, forType: .string)
+            case "remove": controller?.removeLink()
+            default: break
+            }
             #endif
         }
 

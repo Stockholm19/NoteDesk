@@ -29,6 +29,7 @@ enum EditorPage {
   #ed ul, #ed ol { margin: .15em 0; padding-left: 1.6em; }
   #ed li { margin: 0; }
   #ed blockquote { margin: .3em 0; }
+  #ed a[href] { cursor: pointer; }
   #ed pre { margin: .3em 0; }
   /* Размер как в Note Station: атрибуты width/height; только height — ширина по пропорции */
   img { max-width: 100%; object-fit: contain; }
@@ -559,11 +560,60 @@ enum EditorPage {
 
   // Правый клик по картинке или вложению — своё меню приложения (скопировать, сохранить)
   document.addEventListener('contextmenu', e => {
+    const a = linkAt(e.target);
+    if (a) {
+      e.preventDefault();
+      linkEl = a; linkRange = null;
+      post('linkMenu', Object.assign(linkInfo(a), { x: e.clientX, y: e.clientY }));
+      return;
+    }
     const t = e.target.closest('img[ref], video[data-file], .nd-file');
     if (!t) return;
     e.preventDefault();
     post('menu', { ref: t.getAttribute('ref'), file: t.getAttribute('data-file'), x: e.clientX, y: e.clientY });
   });
+
+  // ---- Ссылки ----
+  // Клик по ссылке открывает её (на Mac — сразу, на iPhone — через меню действий).
+  // ⌥-клик ставит курсор внутрь ссылки, как обычный клик в тексте.
+  // Создать или изменить: ⌘K или кнопка «Ссылка» — окно с адресом и текстом в приложении.
+  let linkEl = null;      // ссылка, с которой сейчас работаем
+  let linkRange = null;   // выделение на момент открытия окна ссылки
+
+  function linkAt(node) {
+    while (node && node !== ed) {
+      if (node.nodeType === 1 && node.tagName === 'A' && node.hasAttribute('href')) return node;
+      node = node.parentNode;
+    }
+    return null;
+  }
+  function normalizeURL(u) {
+    u = (u || '').trim();
+    if (!u) return '';
+    if (/^[a-z][a-z0-9+.-]*:/i.test(u)) return u;
+    if (/^[^\s@/]+@[^\s@/]+\.[^\s@/]+$/.test(u)) return 'mailto:' + u;
+    return 'https://' + u;
+  }
+  const linkInfo = a => ({ url: a ? a.getAttribute('href') : '', text: a ? a.textContent : '', inLink: !!a });
+
+  ed.addEventListener('click', e => {
+    const a = linkAt(e.target);
+    if (!a || e.altKey) return;
+    e.preventDefault();
+    linkEl = a; linkRange = null;
+    post('link', Object.assign(linkInfo(a), { x: e.clientX, y: e.clientY }));
+  });
+  ed.addEventListener('keydown', e => {
+    if (!(e.metaKey || e.ctrlKey) || e.code !== 'KeyK' || e.altKey || e.shiftKey) return;
+    e.preventDefault();
+    post('linkEdit', nd.beginLink());
+  });
+
+  function placeCaretAfter(node) {
+    const r = document.createRange();
+    r.setStartAfter(node); r.collapse(true);
+    const s = window.getSelection(); s.removeAllRanges(); s.addRange(r);
+  }
 
   const filesBox = document.getElementById('nd-files');
 
@@ -599,6 +649,52 @@ enum EditorPage {
       setTimeout(() => { suppress = false; }, 0);
     },
     undo() { if (hist.undo.length) undo(); },
+    // Окно ссылки: запоминаем выделение (фокус уйдёт в окно приложения)
+    beginLink() {
+      const s = window.getSelection();
+      linkRange = s.rangeCount && ed.contains(s.getRangeAt(0).commonAncestorContainer) ? s.getRangeAt(0).cloneRange() : null;
+      linkEl = linkRange ? (linkAt(linkRange.startContainer) || linkAt(linkRange.endContainer)) : null;
+      const info = linkInfo(linkEl);
+      if (!linkEl && linkRange) info.text = linkRange.toString();
+      return info;
+    },
+    applyLink(url, text) {
+      const typed = (url || '').trim();
+      url = normalizeURL(url);
+      if (!url) { nd.removeLink(); return; }
+      record('link');
+      let a = linkEl && ed.contains(linkEl) ? linkEl : null;
+      if (a) {
+        a.setAttribute('href', url);
+        if (text && text !== a.textContent) a.textContent = text;
+      } else {
+        a = document.createElement('a');
+        a.setAttribute('href', url);
+        let r = linkRange;
+        if (!r) { r = document.createRange(); r.selectNodeContents(ed); r.collapse(false); }
+        if (r.collapsed || (text && text !== r.toString())) {
+          r.deleteContents();
+          a.textContent = text || typed;
+        } else {
+          a.appendChild(r.extractContents());
+        }
+        r.insertNode(a);
+      }
+      ed.focus();
+      placeCaretAfter(a);
+      linkEl = null; linkRange = null;
+      changed();
+    },
+    removeLink() {
+      const a = linkEl && ed.contains(linkEl) ? linkEl : null;
+      linkEl = null; linkRange = null;
+      if (!a) return;
+      record('unlink');
+      const last = a.lastChild;
+      a.replaceWith(...a.childNodes);
+      if (last) placeCaretAfter(last);
+      changed();
+    },
     redo() { if (hist.redo.length) redo(); },
     setEditable(on) { ed.setAttribute('contenteditable', on ? 'true' : 'false'); },
     setPrefs(size, spell) {
