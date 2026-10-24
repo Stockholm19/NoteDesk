@@ -82,6 +82,17 @@ struct RootView: View {
         }
         .onChange(of: scenePhase) { _, phase in
             if phase == .active { Task { await engine.sync() } }
+            #if os(iOS)
+            // Свернули приложение — успеваем отправить правки (новые заметки, теги),
+            // иначе они ждут следующего открытия
+            if phase == .background {
+                let task = UIApplication.shared.beginBackgroundTask(withName: "NoteDesk sync")
+                Task {
+                    await engine.sync()
+                    UIApplication.shared.endBackgroundTask(task)
+                }
+            }
+            #endif
         }
     }
 }

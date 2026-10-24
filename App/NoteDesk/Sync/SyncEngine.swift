@@ -518,6 +518,62 @@ final class SyncEngine {
         return n
     }
 
+    // MARK: Теги целиком (переименовать, удалить)
+
+    /// Тег и все вложенные («тег/…») — в Note Station это отдельные теги.
+    func tagFamily(_ tag: String) -> [String] {
+        stats.tags.filter { $0 == tag || $0.hasPrefix(tag + "/") }
+    }
+
+    /// Переименовать тег вместе с вложенными. Сначала отправляем свои правки:
+    /// переименование меняет версии заметок на сервере.
+    func renameTag(_ old: String, to new: String) async {
+        let family = tagFamily(old)
+        guard !family.isEmpty, old != new else { return }
+        await syncAndWait()
+        do {
+            let pairs = family.map { ($0, new + $0.dropFirst(old.count)) }
+            let requests = pairs.map { (id: shortcutID(category: "tag", key: $0.0), title: $0.1) }
+            try await authed { api in
+                for r in requests { try await api.renameTag(tagID: r.id, title: r.title) }
+            }
+            let map = Dictionary(uniqueKeysWithValues: pairs)
+            updateLocalTags { tags in tags.map { map[$0] ?? $0 } }
+            await sync()
+        } catch {
+            phase = .error(Self.describe(error))
+        }
+    }
+
+    /// Удалить тег вместе с вложенными: он снимается со всех заметок.
+    func deleteTag(_ tag: String) async {
+        let family = tagFamily(tag)
+        guard !family.isEmpty else { return }
+        await syncAndWait()
+        do {
+            let ids = family.map { shortcutID(category: "tag", key: $0) }
+            try await authed { api in
+                for id in ids { try await api.deleteTag(tagID: id) }
+            }
+            let gone = Set(family)
+            updateLocalTags { tags in tags.filter { !gone.contains($0) } }
+            await sync()
+        } catch {
+            phase = .error(Self.describe(error))
+        }
+    }
+
+    /// Поправить теги в локальной копии так же, как их поменял сервер (заметки не помечаются изменёнными).
+    private func updateLocalTags(_ transform: ([String]) -> [String]) {
+        let notes = (try? context.fetch(FetchDescriptor<LocalNote>())) ?? []
+        for n in notes where !n.tags.isEmpty {
+            let t = transform(n.tags)
+            if t != n.tags { n.tags = t }
+        }
+        try? context.save()
+        refreshStats()
+    }
+
     /// Теги заметки. Уходят на сервер при следующей синхронизации.
     func setTags(_ note: LocalNote, _ tags: [String]) {
         var seen = Set<String>()

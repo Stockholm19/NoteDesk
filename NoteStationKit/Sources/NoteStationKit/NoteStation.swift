@@ -111,6 +111,18 @@ public actor NoteStation {
         return data.firstList(preferring: ["tags", "tag", "list"]).compactMap(NSTag.init)
     }
 
+    /// Переименовать тег. tagID — «Название@uid», как в Tag.list. Теги заметок меняются на сервере.
+    public func renameTag(tagID: String, title: String) async throws {
+        _ = try await dsm.call("SYNO.NoteStation.Tag", "set", version: 1, [
+            "tag_id": .string(tagID), "title": .string(title),
+        ])
+    }
+
+    /// Удалить тег: он снимается со всех заметок, сами заметки остаются.
+    public func deleteTag(tagID: String) async throws {
+        _ = try await dsm.call("SYNO.NoteStation.Tag", "delete", version: 1, ["tag_id": .string(tagID)])
+    }
+
     // MARK: Заметки
 
     /// Все заметки (без тела), постранично.

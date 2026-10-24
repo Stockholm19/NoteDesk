@@ -393,15 +393,46 @@ private struct TagRow: View {
     @Environment(SyncEngine.self) private var engine
     let node: TagNode
     @AppStorage("expandedTags") private var expandedRaw = ""
+    @State private var renaming = false
+    @State private var newName = ""
+    @State private var deleting = false
 
     var body: some View {
-        if node.children.isEmpty {
-            label
-        } else {
-            DisclosureGroup(isExpanded: expanded) {
-                ForEach(node.children) { TagRow(node: $0) }
-            } label: { label }
+        Group {
+            if node.children.isEmpty {
+                label
+            } else {
+                DisclosureGroup(isExpanded: expanded) {
+                    ForEach(node.children) { TagRow(node: $0) }
+                } label: { label }
+            }
         }
+        .alert("Переименовать тег", isPresented: $renaming) {
+            TextField("Название", text: $newName)
+                #if os(iOS)
+                .textInputAutocapitalization(.never)
+                #endif
+            Button("Готово") {
+                let name = newName.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !name.isEmpty { Task { await engine.renameTag(node.path, to: name) } }
+            }
+            Button("Отмена", role: .cancel) {}
+        } message: {
+            Text(subtagCount > 0
+                 ? "Вложенные теги (\(subtagCount)) переименуются вместе с ним. «/» в названии делает тег вложенным."
+                 : "«/» в названии делает тег вложенным.")
+        }
+        .confirmationDialog(deleteTitle, isPresented: $deleting, titleVisibility: .visible) {
+            Button("Удалить тег", role: .destructive) { Task { await engine.deleteTag(node.path) } }
+        } message: {
+            Text("Тег снимется со всех заметок, сами заметки останутся.")
+        }
+    }
+
+    private var subtagCount: Int { engine.tagFamily(node.path).filter { $0 != node.path }.count }
+
+    private var deleteTitle: String {
+        subtagCount > 0 ? "Удалить тег «\(node.name)» и вложенные (\(subtagCount))?" : "Удалить тег «\(node.name)»?"
     }
 
     private var label: some View {
@@ -410,9 +441,14 @@ private struct TagRow: View {
             .tag(SidebarItem.tag(node.path))
             .entryContextMenu {
                 let fav = engine.isFavorite(category: "tag", key: node.path)
-                return [.action(fav ? "Убрать из Избранного" : "Добавить в Избранное", fav ? "star.slash" : "star") {
-                    Task { await engine.setFavorite(!fav, category: "tag", key: node.path) }
-                }]
+                return [
+                    .action("Переименовать…", "pencil") { newName = node.path; renaming = true },
+                    .action(fav ? "Убрать из Избранного" : "Добавить в Избранное", fav ? "star.slash" : "star") {
+                        Task { await engine.setFavorite(!fav, category: "tag", key: node.path) }
+                    },
+                    .divider,
+                    .action("Удалить тег…", "trash") { deleting = true },
+                ]
             }
     }
 

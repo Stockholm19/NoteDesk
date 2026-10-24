@@ -159,6 +159,15 @@ do {
             print("download: \(back.count) байт, совпадает=\(back == data)")
         }
 
+    case "tagtest":
+        // nsctl tagtest <note_id> <tag>... — записать теги заметки так же, как приложение
+        guard args.count >= 1 else { fail("nsctl tagtest <note_id> [tag...]") }
+        let (_, ns) = client()
+        let n = try await ns.note(id: args[0])
+        let r = try await ns.updateNote(id: n.id, ver: n.ver, .init(html: n.content ?? "", tags: Array(args.dropFirst())))
+        let after = try await ns.note(id: n.id)
+        print("ver \(n.ver ?? "-") → \(r.ver ?? "-"), tags: \(after.tags ?? [])")
+
     case "filetest":
         // nsctl filetest <note_id> <file> — прикрепить файл, скачать обратно, удалить вложение
         guard args.count >= 2 else { fail("nsctl filetest <note_id> <file>") }
