@@ -102,7 +102,8 @@ final class MCPController {
         }
     }
     private func read(_ request: ReadRequest, revision: Int) -> ReadReply {
-        guard revision == generation, enabled, engine?.isLoggedIn == true, gate?.isActive == true else { return .unavailable }
+        guard revision == generation, enabled, engine?.isLoggedIn == true,
+              engine?.persistence.hasFailure == false, gate?.isActive == true else { return .unavailable }
         return MCPReadService(context: context).read(request, allowed: allowed, sync: syncSnapshot())
     }
     private func syncSnapshot() -> [String: Any] {

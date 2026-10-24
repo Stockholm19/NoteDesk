@@ -16,6 +16,7 @@ struct SettingsView: View {
                     LabeledContent("Пользователь", value: acc.username)
                     LabeledContent("Сервер", value: acc.serverURL.absoluteString)
                     Button("Выйти…", role: .destructive) { confirmLogout = true }
+                        .disabled(engine.isSyncing || engine.persistence.hasFailure)
                 } else {
                     Text("Не выполнен вход").foregroundStyle(.secondary)
                 }
@@ -47,6 +48,7 @@ struct SettingsView: View {
                     .foregroundStyle(.secondary)
             }
         }
+        .safeAreaInset(edge: .top) { StorageFailureBanner() }
         .formStyle(.grouped)
         .navigationTitle("Настройки")
         #if os(macOS)

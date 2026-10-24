@@ -23,6 +23,24 @@ NoteDesk keeps a local copy of your notes and syncs it with Note Station on your
 
 Not supported yet: encrypted notes (shown as locked), editing tags, smart notebooks, sharing, the to-do list, import/export (use the Note Station web UI for those). On iOS there is no right-click menu for images.
 
+## Local storage safety
+
+- If `NoteDesk-v2` cannot open, NoteDesk does **not** delete the store, WAL or SHM, and does not substitute an in-memory store. All windows and Settings show a retry screen; SyncEngine and MCP are not created until opening succeeds.
+- Explicit saves replace silent SwiftData save failures. A persistent warning in the main window and Settings blocks further sync/network operations and MCP reads until **Retry saving** succeeds. Autosave is disabled so errors cannot silently bypass this state. Keep the app open: unsaved edits are still in memory, not durable.
+- Retry saving saves the **same context**, without rollback, repeating the edit, or replaying a remote request. A successful push acknowledgement stays in memory if its save fails; further push/pull stops. A request already in flight cannot be undone; its read-only version acknowledgement may finish even while saving is blocked. A crash before the acknowledgement is durable (or a lost server reply) remains ambiguous; this release adds no transaction journal, server idempotency or new conflict algorithm.
+- Copied storage diagnostics and storage logs contain only the fixed store name and allowlisted error domains/codes, never error descriptions, userInfo, paths, note content or credentials. Framework-generated Core Data console logs are outside this sanitizer.
+
+Safety tests use only uniquely named temporary stores and injected save errors, including reopen of a note and a 1.2 MB pending attachment. Temporary fixtures are intentionally left in place. Run from the repository root with **existing package caches**:
+
+```sh
+xcrun swift test --package-path NoteDeskMCP --disable-automatic-resolution --skip-update
+xcrun swift test --package-path NoteStationKit --disable-automatic-resolution --skip-update
+xcodebuild -project App/NoteDesk.xcodeproj -scheme NoteDesk -configuration Debug -destination 'generic/platform=macOS' -derivedDataPath .dd-safety -clonedSourcePackagesDirPath .dd/SourcePackages -disableAutomaticPackageResolution -onlyUsePackageVersionsFromResolvedFile -skipPackageUpdates CODE_SIGNING_ALLOWED=NO build
+xcodebuild -project App/NoteDesk.xcodeproj -scheme NoteDesk -configuration Debug -destination 'generic/platform=iOS Simulator' -derivedDataPath .dd-safety -clonedSourcePackagesDirPath .dd/SourcePackages -disableAutomaticPackageResolution -onlyUsePackageVersionsFromResolvedFile -skipPackageUpdates CODE_SIGNING_ALLOWED=NO build
+```
+
+These build commands do not launch the app. Do not use a real store to simulate failures.
+
 ## Requirements
 
 - Synology DSM 7.x with Note Station 2.6 (tested with 2.6.10)
@@ -212,4 +230,4 @@ xcodebuild -project App/NoteDesk.xcodeproj -scheme NoteDesk -derivedDataPath .dd
 
 Tests cover protocol/error responses, real loopback HTTP with synthetic data, bearer/Host/Origin checks, rate limits, argument limits, read policy and actual in-memory SwiftData filtering/missing bodies. Test target symlinks point to the application's actual models/read service, avoiding duplicate test implementations. Signed sandbox execution, real Keychain prompts, GUI clipboard behavior, app restart/logout integration, and Claude bridge interoperability still require manual testing on a disposable account/database. Do **not** launch against a production database to test these changes.
 
-**Existing unrelated risk:** `NoteDeskApp` deletes/recreates the cache if opening its schema fails. This can lose unsynced edits; it predates MCP and was intentionally not changed here. MCP adds no schema changes and does not invoke that app initializer in tests.
+**Storage safety update:** Failed store opening no longer deletes or recreates the cache. The app shows a retry screen without starting sync or MCP. See the storage safety section above for guarantees and limitations. MCP adds no schema changes.

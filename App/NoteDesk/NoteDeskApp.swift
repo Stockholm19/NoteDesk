@@ -3,33 +3,13 @@ import SwiftData
 
 @main
 struct NoteDeskApp: App {
-    let container: ModelContainer
-    @State private var engine: SyncEngine
+    @State private var startup = AppStartup()
     @AppStorage("noteSort") private var sort = NoteSort.modifiedNewest
-
-    init() {
-        // Локальная база — это кэш сервера: при несовместимой схеме просто начинаем заново.
-        let schema = Schema([LocalNote.self, NoteBody.self, LocalNotebook.self, PendingAttachment.self])
-        let config = ModelConfiguration("NoteDesk-v2", schema: schema)
-        let container: ModelContainer
-        do {
-            container = try ModelContainer(for: schema, configurations: config)
-        } catch {
-            for suffix in ["", "-shm", "-wal"] {
-                try? FileManager.default.removeItem(at: URL(fileURLWithPath: config.url.path + suffix))
-            }
-            container = try! ModelContainer(for: schema, configurations: config)
-        }
-        self.container = container
-        _engine = State(initialValue: SyncEngine(context: container.mainContext))
-    }
 
     var body: some Scene {
         WindowGroup {
-            RootView()
-                .environment(engine)
+            StartupView(startup: startup) { RootView() }
         }
-        .modelContainer(container)
         #if os(macOS)
         .defaultSize(width: 1100, height: 720)
         #endif
@@ -38,7 +18,8 @@ struct NoteDeskApp: App {
             EditCommands()
             #endif
             CommandGroup(after: .newItem) {
-                Button("Синхронизировать") { Task { await engine.sync() } }
+                Button("Синхронизировать") { Task { await startup.engine?.sync() } }
+                    .disabled(startup.engine == nil || startup.engine?.persistence.hasFailure == true)
                     .keyboardShortcut("r", modifiers: .command)
             }
             CommandGroup(after: .sidebar) {
@@ -49,9 +30,7 @@ struct NoteDeskApp: App {
         }
         #if os(macOS)
         Settings {
-            SettingsView()
-                .environment(engine)
-                .modelContainer(container)
+            StartupView(startup: startup) { SettingsView() }
         }
         #endif
     }
@@ -70,6 +49,7 @@ struct RootView: View {
                 LoginView()
             }
         }
+        .safeAreaInset(edge: .top) { StorageFailureBanner() }
         .task(id: "\(engine.isLoggedIn)-\(syncInterval)") {
             // Фоновая синхронизация с интервалом из настроек, пока приложение на экране
             guard engine.isLoggedIn else { return }
@@ -120,3 +100,83 @@ struct EditCommands: Commands {
     }
 }
 #endif
+
+@MainActor @Observable
+final class AppStartup {
+    let store = StoreOpening()
+    private(set) var engine: SyncEngine?
+    private var didAttemptOpen = false
+
+    func start() {
+        guard !didAttemptOpen else { return }
+        retry()
+    }
+
+    func retry() {
+        guard engine == nil else { return }
+        didAttemptOpen = true
+        store.retry()
+        if let container = store.container {
+            engine = SyncEngine(context: container.mainContext)
+        }
+    }
+}
+
+struct StartupView<Content: View>: View {
+    let startup: AppStartup
+    @ViewBuilder var content: () -> Content
+
+    var body: some View {
+        Group {
+            if let container = startup.store.container, let engine = startup.engine {
+                content()
+                    .environment(engine)
+                    .modelContainer(container)
+            } else {
+                VStack(alignment: .leading, spacing: 16) {
+                    Text("Локальная база недоступна").font(.title2)
+                    Text("База не была сброшена или заменена. Синхронизация и MCP не запущены. Повторите открытие; если ошибка остается, сохраните диагностику и обратитесь за помощью.")
+                    if let diagnostic = startup.store.diagnostic {
+                        Text(diagnostic).font(.caption.monospaced()).textSelection(.enabled)
+                        Button("Копировать диагностику") { copyStorageDiagnostic(diagnostic) }
+                    }
+                    Button("Повторить открытие") { startup.retry() }
+                }
+                .padding(24)
+                .frame(maxWidth: 600)
+            }
+        }
+        .task { startup.start() }
+    }
+}
+
+struct StorageFailureBanner: View {
+    @Environment(SyncEngine.self) private var engine
+
+    var body: some View {
+        if let diagnostic = engine.persistence.diagnostic {
+            VStack(alignment: .leading, spacing: 8) {
+                Label("Изменения не сохранены на устройстве", systemImage: "exclamationmark.triangle.fill")
+                    .font(.headline)
+                Text("Не закрывайте приложение. Изменения остаются в памяти; отправка на сервер приостановлена. Часть уже начатой отправки могла завершиться. Повтор сохраняет только локальную базу.")
+                    .font(.caption)
+                HStack {
+                    Button("Повторить сохранение") { engine.retryLocalSave() }
+                    Button("Копировать диагностику") { copyStorageDiagnostic(diagnostic) }
+                }
+            }
+            .padding()
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(.orange.opacity(0.15))
+        }
+    }
+}
+
+private func copyStorageDiagnostic(_ value: String) {
+    #if os(macOS)
+    NSPasteboard.general.clearContents()
+    NSPasteboard.general.setString(value, forType: .string)
+    #else
+    UIPasteboard.general.string = value
+    #endif
+}

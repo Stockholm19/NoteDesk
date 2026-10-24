@@ -40,6 +40,7 @@ final class SyncEngine {
     var mcp: MCPController?
     #endif
 
+    let persistence: LocalPersistence
     private let context: ModelContext
     private var dsm: DSMClient?
     private var api: NoteStation?
@@ -54,6 +55,7 @@ final class SyncEngine {
 
     init(context: ModelContext) {
         self.context = context
+        self.persistence = LocalPersistence(context: context)
         if let saved = Keychain.load() {
             account = saved
             connect(saved)
@@ -64,6 +66,17 @@ final class SyncEngine {
         mcp = MCPController(context: context, engine: self)
         mcp?.reconcile()
         #endif
+    }
+
+    private func saveLocalChanges() {
+        do { try persistence.save() }
+        catch { pendingSync?.cancel() }
+    }
+
+    func retryLocalSave() {
+        guard persistence.retry() else { return }
+        refreshStats()
+        // Do not replay a remote operation: its acknowledgement may be what just saved.
     }
 
     func refreshStats() {
@@ -109,6 +122,8 @@ final class SyncEngine {
     }
 
     func logout() async {
+        guard !isSyncing, !persistence.hasFailure else { return }
+        do { try persistence.save() } catch { return }
         #if os(macOS)
         mcp?.logout()
         #endif
@@ -117,12 +132,17 @@ final class SyncEngine {
         account = nil
         dsm = nil
         api = nil
-        try? context.delete(model: LocalNote.self)
-        try? context.delete(model: LocalNotebook.self)
-        try? context.delete(model: PendingAttachment.self)
+        do {
+            try context.delete(model: LocalNote.self)
+            try context.delete(model: LocalNotebook.self)
+            try context.delete(model: PendingAttachment.self)
+        } catch {
+            phase = .error("Local account cleanup failed.")
+            return
+        }
         shortcuts = []
         UserDefaults.standard.removeObject(forKey: "shortcuts")
-        try? context.save()
+        saveLocalChanges()
         phase = .loggedOut
         lastSync = nil
         stats = Stats()
@@ -135,16 +155,20 @@ final class SyncEngine {
     }
 
     /// Выполнить запрос; если сессия истекла — тихо перелогиниться и повторить.
-    private func authed<T: Sendable>(_ op: (NoteStation) async throws -> T) async throws -> T {
+    private func authed<T: Sendable>(acknowledgementRead: Bool = false, _ op: (NoteStation) async throws -> T) async throws -> T {
         guard let api, let dsm, var acc = account else { throw DSMError.notLoggedIn }
+        // Also checks edits made during an earlier await before any further request.
+        if !acknowledgementRead { try persistence.save() }
         do {
             if await dsm.session == nil { throw DSMError.notLoggedIn }
+            if !acknowledgementRead { try persistence.save() }
             return try await op(api)
         } catch let e as DSMError where e.isSessionError {
             let session = try await dsm.login(account: acc.username, password: acc.password)
             acc.session = session
             account = acc
             Keychain.save(acc)
+            if !acknowledgementRead { try persistence.save() }
             return try await op(api)
         }
     }
@@ -159,6 +183,7 @@ final class SyncEngine {
     /// Отложенная синхронизация — после правок, чтобы не слать запрос на каждый символ.
     func scheduleSync(after seconds: Double = 3) {
         pendingSync?.cancel()
+        guard !persistence.hasFailure else { return }
         pendingSync = Task { [weak self] in
             try? await Task.sleep(for: .seconds(seconds))
             guard !Task.isCancelled else { return }
@@ -170,28 +195,31 @@ final class SyncEngine {
     }
 
     func sync() async {
-        guard isLoggedIn else { return }
+        guard isLoggedIn, !persistence.hasFailure else { return }
         if isSyncing { resyncRequested = true; return }
         phase = .syncing
         do {
+            try persistence.save()
             try await push()
             try await pull()
-            try context.save()
+            try persistence.save()
             lastSync = .now
             phase = .idle
             refreshStats()
+        } catch is LocalPersistence.Failure {
+            phase = .error("Local changes are not saved. Retry local saving.")
         } catch let e as DSMError where e.code == 403 || e.code == 400 {
             // Пароль сменили или включили 2FA без доверенного устройства
             syncLog.error("auth: \(e.localizedDescription, privacy: .public)")
             phase = .error("Нужно войти заново: \(e.localizedDescription)")
         } catch {
             syncLog.error("sync: \(String(describing: error), privacy: .public)")
-            try? context.save()
+            saveLocalChanges()
             phase = .error(Self.describe(error))
         }
         if resyncRequested {
             resyncRequested = false
-            await sync()
+            if !persistence.hasFailure { await sync() }
         }
     }
 
@@ -223,6 +251,7 @@ final class SyncEngine {
                 }
                 pendingAttachments(for: note.localID).forEach { context.delete($0) }
                 context.delete(note)
+                try persistence.save()
                 continue
             }
 
@@ -237,6 +266,7 @@ final class SyncEngine {
                 guard !note.isDeleted else { continue }   // выход из аккаунта во время запроса
                 note.remoteID = r.id
                 try await markPushed(note, id: r.id, sentTitle: title, sentHTML: html)
+                try persistence.save()
                 // Картинки и теги — вторым запросом: create их не принимает
                 let newTags = (tags?.isEmpty ?? true) ? nil : tags
                 if !files.isEmpty || newTags != nil {
@@ -248,7 +278,7 @@ final class SyncEngine {
                     try await markPushed(note, id: r.id, sentTitle: title, sentHTML: html)
                 }
                 if note.tags == (tags ?? note.tags) { note.tagsEdited = false }
-                try context.save()
+                try persistence.save()
                 continue
             }
 
@@ -265,7 +295,7 @@ final class SyncEngine {
             } catch let e as DSMError where e.code == 1064 {
                 try await resolveConflict(note, id: id)
             }
-            try context.save()
+            try persistence.save()
         }
     }
 
@@ -306,6 +336,7 @@ final class SyncEngine {
         }
         copy.remoteID = r.id
         try await markPushed(copy, id: r.id, sentTitle: copy.title, sentHTML: copy.html ?? "")
+        try persistence.save()
         let files = uploadableAttachments(for: copy, html: copy.html ?? "")
         if !files.isEmpty {
             let ver = copy.remoteVer
@@ -330,7 +361,9 @@ final class SyncEngine {
     /// пока шёл запрос, пользователь мог продолжать печатать, и перезапись
     /// серверным HTML стёрла бы эти символы и перезагрузила редактор.
     private func markPushed(_ note: LocalNote, id: String, sentTitle: String, sentHTML: String) async throws {
-        let remote = try await authed { try await $0.note(id: id) }
+        // Finish this read-only acknowledgement even if an edit failed to save while push
+        // was in flight. Keep the server version in memory for local-only save retry.
+        let remote = try await authed(acknowledgementRead: true) { try await $0.note(id: id) }
         guard !note.isDeleted else { return }
         note.remoteVer = Self.version(remote)
         if let m = remote.mtime { note.mtime = m }
@@ -410,7 +443,7 @@ final class SyncEngine {
                 context.insert(n)
             }
         }
-        try context.save()
+        try persistence.save()
         refreshStats()
 
         // Тела изменившихся заметок — по несколько параллельно
@@ -450,9 +483,9 @@ final class SyncEngine {
             }
             contentProgress = (min((i + 1) * 8, toFetch.count), toFetch.count)
             // Каждое сохранение перерисовывает списки — сохраняем пачками по ~100 заметок
-            if (i + 1) % 12 == 0 { try context.save() }
+            if (i + 1) % 12 == 0 { try persistence.save() }
         }
-        try context.save()
+        try persistence.save()
         if failed > 0 { syncLog.error("не загрузилось заметок: \(failed, privacy: .public)") }
     }
 
@@ -463,7 +496,7 @@ final class SyncEngine {
         do {
             let remote = try await authed { try await $0.note(id: id) }
             if !note.isDirty { apply(remote, to: note, includeContent: true) }
-            try? context.save()
+            try persistence.save()
             return nil
         } catch {
             syncLog.error("loadContent \(id, privacy: .public): \(error.localizedDescription, privacy: .public)")
@@ -513,7 +546,7 @@ final class SyncEngine {
         let n = LocalNote(notebookID: defaultBook, title: "", html: "<p><br></p>", tags: tags, isDirty: true)
         n.tagsEdited = !tags.isEmpty
         context.insert(n)
-        try? context.save()
+        saveLocalChanges()
         refreshStats()
         return n
     }
@@ -570,7 +603,7 @@ final class SyncEngine {
             let t = transform(n.tags)
             if t != n.tags { n.tags = t }
         }
-        try? context.save()
+        saveLocalChanges()
         refreshStats()
     }
 
@@ -584,7 +617,7 @@ final class SyncEngine {
         note.tagsEdited = true
         note.isDirty = true
         note.mtime = .now
-        try? context.save()
+        saveLocalChanges()
         refreshStats()
         scheduleSync()
     }
@@ -597,7 +630,7 @@ final class SyncEngine {
         }
         note.isDirty = true
         note.mtime = .now
-        try? context.save()
+        saveLocalChanges()
         scheduleSync()
     }
 
@@ -678,7 +711,7 @@ final class SyncEngine {
         context.insert(PendingAttachment(noteLocalID: note.localID, ref: ref, filename: filename,
                                          mimeType: mimeType, data: data))
         note.isDirty = true
-        try? context.save()
+        saveLocalChanges()
         scheduleSync()
     }
 
@@ -694,7 +727,7 @@ final class SyncEngine {
     func move(_ note: LocalNote, to notebookID: String) {
         note.notebookID = notebookID
         note.isDirty = true
-        try? context.save()
+        saveLocalChanges()
         refreshStats()
         scheduleSync(after: 0.5)
     }
@@ -705,7 +738,7 @@ final class SyncEngine {
         // к удалённой модели SwiftData роняет приложение. Помечаем — а push
         // удалит её сам: на сервере в корзину, локальную — просто из базы.
         note.isTrashedLocally = true
-        try? context.save()
+        saveLocalChanges()
         refreshStats()
         scheduleSync(after: 0.5)
     }
@@ -768,7 +801,7 @@ final class SyncEngine {
                 try await authed { try await $0.setNotebookStack(id: nb.id, stack: stack) }
             }
             context.insert(LocalNotebook(remoteID: nb.id, title: nb.title, ver: nb.ver, stack: stack))
-            try? context.save()
+            try persistence.save()
             await sync()
             return nb.id
         } catch {
@@ -819,7 +852,7 @@ final class SyncEngine {
             LocalAttachmentMeta(id: $0.id, ref: $0.ref, name: $0.name, type: $0.type, size: $0.size, md5: $0.md5)
         }
         note.cachedAttachments = metas
-        try? context.save()
+        saveLocalChanges()
         return remote.attachments
     }
 
@@ -836,7 +869,7 @@ final class SyncEngine {
         }
         if note.cachedAttachments != metas {
             note.cachedAttachments = metas
-            try? context.save()
+            saveLocalChanges()
         }
         return remote.attachments
     }
@@ -872,14 +905,14 @@ final class SyncEngine {
 
     /// Текст не менялся — берём только новую версию с сервера.
     private func refreshVersion(_ note: LocalNote, id: String) async throws {
-        let remote = try await authed { try await $0.note(id: id) }
+        let remote = try await authed(acknowledgementRead: true) { try await $0.note(id: id) }
         note.remoteVer = Self.version(remote)
         if let m = remote.mtime { note.mtime = m }
         note.thumbMD5 = remote.thumbMD5
         note.cachedAttachments = remote.attachments.map {
             LocalAttachmentMeta(id: $0.id, ref: $0.ref, name: $0.name, type: $0.type, size: $0.size, md5: $0.md5)
         }
-        try? context.save()
+        try persistence.save()
     }
 
     /// Файл картинки или вложения — для копирования и сохранения.
