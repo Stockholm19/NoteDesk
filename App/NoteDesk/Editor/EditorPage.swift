@@ -603,6 +603,27 @@ enum EditorPage {
     linkEl = a; linkRange = null;
     post('link', Object.assign(linkInfo(a), { x: e.clientX, y: e.clientY }));
   });
+  // iPhone: короткое нажатие на ссылку не ставит курсор и не поднимает клавиатуру —
+  // сразу меню действий. Долгое нажатие и прокрутка работают как обычно.
+  let linkTouch = null;
+  ed.addEventListener('touchstart', e => {
+    const a = e.touches.length === 1 ? linkAt(e.target) : null;
+    linkTouch = a ? { a, x: e.touches[0].clientX, y: e.touches[0].clientY, t: Date.now() } : null;
+  }, { passive: true });
+  ed.addEventListener('touchmove', e => {
+    if (!linkTouch) return;
+    const t = e.touches[0];
+    if (Math.abs(t.clientX - linkTouch.x) > 10 || Math.abs(t.clientY - linkTouch.y) > 10) linkTouch = null;
+  }, { passive: true });
+  ed.addEventListener('touchend', e => {
+    const lt = linkTouch;
+    linkTouch = null;
+    if (!lt || Date.now() - lt.t > 500) return;
+    e.preventDefault();   // без этого WebKit поставит курсор и откроет клавиатуру
+    linkEl = lt.a; linkRange = null;
+    post('link', Object.assign(linkInfo(lt.a), { x: lt.x, y: lt.y }));
+  });
+
   ed.addEventListener('keydown', e => {
     if (!(e.metaKey || e.ctrlKey) || e.code !== 'KeyK' || e.altKey || e.shiftKey) return;
     e.preventDefault();
