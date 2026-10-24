@@ -5,6 +5,9 @@ struct SidebarView: View {
     @Environment(SyncEngine.self) private var engine
     @Binding var selection: SidebarItem?
     var onCreate: (CreateRequest) -> Void = { _ in }
+    /// Новая заметка (nil — в записную книжку по умолчанию) — кнопка «+» на iPhone,
+    /// где список заметок с его меню «Создать» скрыт за боковой панелью.
+    var onNewNote: (String?) -> Void = { _ in }
     @Query(sort: [SortDescriptor(\LocalNotebook.title, comparator: .localizedStandard)]) private var notebooks: [LocalNotebook]
     @AppStorage("expandedStacks") private var expandedRaw = ""
     @AppStorage("expandedSections") private var sectionsRaw = "books,fav,tags"
@@ -106,6 +109,11 @@ struct SidebarView: View {
         .safeAreaInset(edge: .bottom) { SyncStatusLine() }
         .navigationTitle("NoteDesk")
         .toolbar {
+            #if os(iOS)
+            ToolbarItem(placement: .primaryAction) {
+                CreateMenu(newNote: { onNewNote(nil) }, newNoteIn: { onNewNote($0) }, create: onCreate)
+            }
+            #endif
             ToolbarItem { SyncStatusButton() }
             ToolbarItem {
                 Menu {

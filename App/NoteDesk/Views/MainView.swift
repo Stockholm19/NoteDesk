@@ -31,7 +31,7 @@ struct MainView: View {
 
     var body: some View {
         NavigationSplitView(columnVisibility: $columns) {
-            SidebarView(selection: $selection, onCreate: { creating = $0 })
+            SidebarView(selection: $selection, onCreate: { creating = $0 }, onNewNote: newNote(in:))
                 .navigationSplitViewColumnWidth(min: 200, ideal: 260)
         } content: {
             if selection == .trash {
@@ -73,9 +73,10 @@ struct MainView: View {
     }
 
     /// «Создать заметку в…»: открываем эту книгу и новую заметку в ней.
-    private func newNote(in notebookID: String) {
+    /// nil — записная книжка по умолчанию (как «+» в Note Station).
+    private func newNote(in notebookID: String?) {
         let n = engine.createNote(in: notebookID)
-        selection = .notebook(notebookID)
+        selection = n.notebookID.map { .notebook($0) } ?? .all
         selectedNote = n.localID
     }
 }
