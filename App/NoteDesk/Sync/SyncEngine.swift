@@ -233,6 +233,7 @@ final class SyncEngine {
 
             guard let id = note.remoteID else {
                 let r = try await authed { try await $0.createNote(title: title, notebookID: notebookID, html: html) }
+                guard !note.isDeleted else { continue }   // выход из аккаунта во время запроса
                 note.remoteID = r.id
                 try await markPushed(note, id: r.id, sentTitle: title, sentHTML: html)
                 // Картинки — вторым запросом: в create Note Station вложения не принимает
@@ -323,6 +324,7 @@ final class SyncEngine {
     /// серверным HTML стёрла бы эти символы и перезагрузила редактор.
     private func markPushed(_ note: LocalNote, id: String, sentTitle: String, sentHTML: String) async throws {
         let remote = try await authed { try await $0.note(id: id) }
+        guard !note.isDeleted else { return }
         note.remoteVer = Self.version(remote)
         if let m = remote.mtime { note.mtime = m }
         var refs: [String: String] = [:]
@@ -618,12 +620,11 @@ final class SyncEngine {
     }
 
     func trash(_ note: LocalNote) {
-        if note.remoteID == nil {
-            pendingAttachments(for: note.localID).forEach { context.delete($0) }
-            context.delete(note)
-        } else {
-            note.isTrashedLocally = true
-        }
+        // Не удаляем объект сразу, даже если на сервере его ещё нет: заметка может
+        // как раз отправляться (create уже ушёл), и обращение синхронизации
+        // к удалённой модели SwiftData роняет приложение. Помечаем — а push
+        // удалит её сам: на сервере в корзину, локальную — просто из базы.
+        note.isTrashedLocally = true
         try? context.save()
         refreshStats()
         scheduleSync(after: 0.5)
