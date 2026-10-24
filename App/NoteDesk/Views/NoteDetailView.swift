@@ -169,14 +169,13 @@ struct NoteEditorView: View {
                 }
                 .menuStyle(.borderlessButton)
                 .fixedSize()
-                ForEach(note.tags, id: \.self) { t in
-                    Text("#\(t)").foregroundStyle(.secondary)
-                }
                 Spacer()
                 Text(note.mtime, format: .dateTime.day().month().hour().minute())
                     .foregroundStyle(.tertiary)
+                    .lineLimit(1)
             }
             .font(.caption)
+            NoteTagsRow(note: note)
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 12)

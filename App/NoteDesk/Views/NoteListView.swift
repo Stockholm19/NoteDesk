@@ -168,6 +168,7 @@ struct NoteListView: View {
         guard !q.isEmpty else { return scoped }
         return scoped.filter {
             $0.title.localizedStandardContains(q) || $0.brief.localizedStandardContains(q)
+                || $0.tags.contains { $0.localizedStandardContains(q.hasPrefix("#") ? String(q.dropFirst()) : q) }
                 || ($0.html.map { HTMLSearch.text($0).localizedStandardContains(q) } ?? false)
         }
     }
@@ -207,8 +208,10 @@ struct NoteListView: View {
 
     private func newNote() {
         var nb: String? = nil
+        var tags: [String] = []
         if case .notebook(let id) = filter { nb = id }
-        let n = engine.createNote(in: nb)
+        if case .tag(let t) = filter { tags = [t] }   // как в Note Station: новая заметка получает открытый тег
+        let n = engine.createNote(in: nb, tags: tags)
         selection = n.localID
     }
 

@@ -230,21 +230,24 @@ final class SyncEngine {
             let html = note.html ?? ""
             let notebookID = note.notebookID
             let files = uploadableAttachments(for: note, html: html)
+            let tags: [String]? = note.tagsEdited ? note.tags : nil
 
             guard let id = note.remoteID else {
                 let r = try await authed { try await $0.createNote(title: title, notebookID: notebookID, html: html) }
                 guard !note.isDeleted else { continue }   // выход из аккаунта во время запроса
                 note.remoteID = r.id
                 try await markPushed(note, id: r.id, sentTitle: title, sentHTML: html)
-                // Картинки — вторым запросом: в create Note Station вложения не принимает
-                if !files.isEmpty {
+                // Картинки и теги — вторым запросом: create их не принимает
+                let newTags = (tags?.isEmpty ?? true) ? nil : tags
+                if !files.isEmpty || newTags != nil {
                     let ver = note.remoteVer
                     _ = try await authed {
-                        try await $0.updateNote(id: r.id, ver: ver, .init(html: html), attachments: files.map(\.upload))
+                        try await $0.updateNote(id: r.id, ver: ver, .init(html: html, tags: newTags), attachments: files.map(\.upload))
                     }
                     files.forEach { context.delete($0.model) }
                     try await markPushed(note, id: r.id, sentTitle: title, sentHTML: html)
                 }
+                if note.tags == (tags ?? note.tags) { note.tagsEdited = false }
                 try context.save()
                 continue
             }
@@ -252,11 +255,13 @@ final class SyncEngine {
             let ver = note.remoteVer
             do {
                 _ = try await authed {
-                    try await $0.updateNote(id: id, ver: ver, .init(title: title, html: html, notebookID: notebookID),
+                    try await $0.updateNote(id: id, ver: ver, .init(title: title, html: html, notebookID: notebookID, tags: tags),
                                             attachments: files.map(\.upload))
                 }
                 files.forEach { context.delete($0.model) }
                 try await markPushed(note, id: id, sentTitle: title, sentHTML: html)
+                // Теги меняли во время запроса — отправим следующим заходом
+                if let tags, note.tags == tags { note.tagsEdited = false }
             } catch let e as DSMError where e.code == 1064 {
                 try await resolveConflict(note, id: id)
             }
@@ -309,6 +314,8 @@ final class SyncEngine {
             files.forEach { context.delete($0.model) }
             try await markPushed(copy, id: r.id, sentTitle: copy.title, sentHTML: html)
         }
+        // Теги копии уйдут следующим заходом (create их не принимает)
+        if !copy.tags.isEmpty { copy.tagsEdited = true; copy.isDirty = true }
         conflictsResolved += 1
     }
 
@@ -498,15 +505,32 @@ final class SyncEngine {
 
     // MARK: Локальные действия из UI
 
-    func createNote(in notebookID: String?) -> LocalNote {
+    /// tags — когда заметку создают, открыв тег: она сразу получает этот тег, как в Note Station.
+    func createNote(in notebookID: String?, tags: [String] = []) -> LocalNote {
         // Без выбранного блокнота — в записную книжку по умолчанию, как в Note Station
         let books = (try? context.fetch(FetchDescriptor<LocalNotebook>())) ?? []
         let defaultBook = notebookID ?? (books.first { $0.isPreset } ?? books.first)?.remoteID
-        let n = LocalNote(notebookID: defaultBook, title: "", html: "<p><br></p>", isDirty: true)
+        let n = LocalNote(notebookID: defaultBook, title: "", html: "<p><br></p>", tags: tags, isDirty: true)
+        n.tagsEdited = !tags.isEmpty
         context.insert(n)
         try? context.save()
         refreshStats()
         return n
+    }
+
+    /// Теги заметки. Уходят на сервер при следующей синхронизации.
+    func setTags(_ note: LocalNote, _ tags: [String]) {
+        var seen = Set<String>()
+        let clean = tags.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty && seen.insert($0.lowercased()).inserted }
+        guard clean != note.tags else { return }
+        note.tags = clean
+        note.tagsEdited = true
+        note.isDirty = true
+        note.mtime = .now
+        try? context.save()
+        refreshStats()
+        scheduleSync()
     }
 
     func edit(_ note: LocalNote, title: String? = nil, html: String? = nil) {

@@ -36,6 +36,9 @@ final class LocalNote {
     @Relationship(deleteRule: .cascade) var body: NoteBody?
     var brief: String
     var tags: [String]
+    /// Теги изменены здесь и ещё не отправлены (теги уходят на сервер только тогда,
+    /// чтобы не затереть теги, изменённые в Note Station).
+    var tagsEdited: Bool = false
     /// Версия на сервере, от которой сделаны локальные правки.
     var remoteVer: String?
     var ctime: Date
