@@ -256,7 +256,7 @@ struct NoteRow: View {
                 HStack(spacing: 4) {
                     // Дата уже видна в бейдже — повторяем её только рядом с превью
                     if hasThumb {
-                        Text(date.formatted(.dateTime.day().month().hour().minute()))
+                        Text(date.formatted(.dateTime.year().day().month().hour().minute()))
                     }
                     if let notebook { Text(hasThumb ? "· \(notebook)" : notebook) }
                 }

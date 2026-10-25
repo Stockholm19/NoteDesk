@@ -170,7 +170,7 @@ struct NoteEditorView: View {
                 .menuStyle(.borderlessButton)
                 .fixedSize()
                 Spacer()
-                Text(note.mtime, format: .dateTime.day().month().hour().minute())
+                Text(note.mtime, format: .dateTime.year().day().month().hour().minute())
                     .foregroundStyle(.tertiary)
                     .lineLimit(1)
             }
